@@ -15,6 +15,7 @@ class LLM:
         model: str,
         base_url: str,
         api_key: str = "dummy",
+        project: str = None,
         temperature: float = 0.0,
     ):
         self.model = model
@@ -22,6 +23,7 @@ class LLM:
         self.client = OpenAI(
             api_key=api_key,
             base_url=base_url,
+            project=project
         )
 
     def chat(self, messages: list[dict[str, str]]) -> str:

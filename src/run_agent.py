@@ -12,6 +12,7 @@ llm = LLM(
     model=os.getenv("MODEL_DEFAULT"),
     base_url=os.getenv("OPENAI_BASE_URL"),
     api_key=os.getenv("OPENAI_API_KEY"),
+    project=os.getenv("YANDEX_CLOUD_FOLDER"),
 )
 
 parser = QueryParser(
