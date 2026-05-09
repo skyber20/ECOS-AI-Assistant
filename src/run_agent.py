@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -12,7 +13,7 @@ llm = LLM(
     model=os.getenv("MODEL_DEFAULT"),
     base_url=os.getenv("OPENAI_BASE_URL"),
     api_key=os.getenv("OPENAI_API_KEY"),
-    project=os.getenv("YANDEX_CLOUD_FOLDER"),
+    # project=os.getenv("YANDEX_CLOUD_FOLDER"),
 )
 
 parser = QueryParser(
@@ -20,8 +21,8 @@ parser = QueryParser(
     prompt_path=Path("prompts/query_parser.md"),
 )
 
-result = parser.parse(
-    "Собери динамику ВРП Архангельской области за 2015-2024 годы"
-)
+query = " ".join(sys.argv[1:]) or "Собери динамику ВРП Архангельской области за 2015-2024 годы"
+
+result = parser.parse(query)
 
 print(json.dumps(result.model_dump(), ensure_ascii=False, indent=2))

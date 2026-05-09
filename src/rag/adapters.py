@@ -43,6 +43,8 @@ class WorldBankAdapter:
                 "data_path": str(self.root / "parquet" / f"{indicator_id}.parquet"),
                 "url": source_meta.get("url") or "",
             }
+            id_text = " ".join([indicator_id] * 8)
+            title_text = " ".join([title] * 4)
 
             yield {
                 "doc_id": f"world_bank:{indicator_id}",
@@ -50,8 +52,8 @@ class WorldBankAdapter:
                 "source_id": indicator_id,
                 "title": title,
                 "text": join_parts(
-                    title,
-                    title,
+                    id_text,
+                    title_text,
                     item.get("unit"),
                     topics,
                     source_name,
