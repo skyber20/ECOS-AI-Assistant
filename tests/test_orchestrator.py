@@ -1,6 +1,7 @@
 import json
 import unittest
 
+from dataset_search_planner import BuildStrategy
 from intent_parser import (
     Complexity,
     DatasetSpec,
@@ -146,10 +147,15 @@ class OrchestratorTest(unittest.TestCase):
 
         result = agent.run(query)
 
-        self.assertEqual(result.status, OrchestrationStatus.DESIGN_READY)
+        self.assertEqual(result.status, OrchestrationStatus.BUILD_PLAN_READY)
         self.assertIsNotNone(result.research_design)
         self.assertIsNotNone(result.target_dataset_structure)
         self.assertEqual(result.target_dataset_structure.row_grain, "год")
+        self.assertIsNotNone(result.dataset_match_report)
+        self.assertEqual(
+            result.dataset_match_report.build_plan.strategy,
+            BuildStrategy.NEEDS_SOURCE_DISCOVERY,
+        )
         self.assertEqual(len(client.requests), 4)
         self.assertIn(
             "исправляешь ответ инструмента parse_intent",

@@ -8,6 +8,12 @@ warnings.simplefilter("ignore", LangChainPendingDeprecationWarning)
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from dataset_search_planner import (
+    DatasetMatchReport,
+    DatasetRegistry,
+    EmptyDatasetRegistry,
+    create_dataset_match_report,
+)
 from intent_parser import (
     IntentType,
     LLMSettings,
@@ -34,6 +40,7 @@ class OrchestrationStatus(str, Enum):
     NEEDS_CLARIFICATION = "needs_clarification"
     READY_FOR_DESIGN = "ready_for_design"
     DESIGN_READY = "design_ready"
+    BUILD_PLAN_READY = "build_plan_ready"
     NO_DATA = "no_data"
     UNSUPPORTED = "unsupported"
 
@@ -64,6 +71,7 @@ class OrchestrationResult(BaseModel):
     clarification_requests: list[ClarificationRequest] = Field(default_factory=list)
     research_design: ResearchStudyDesign | None = None
     target_dataset_structure: TargetDatasetStructure | None = None
+    dataset_match_report: DatasetMatchReport | None = None
     message: str | None = None
 
     @field_validator("clarification_requests", mode="before")
@@ -102,6 +110,7 @@ class ResearchAgentState(TypedDict, total=False):
     readiness: OrchestrationResult
     research_design: ResearchStudyDesign
     target_dataset_structure: TargetDatasetStructure
+    dataset_match_report: DatasetMatchReport
     result: OrchestrationResult
     next_node: str
     refined_done: bool
@@ -199,10 +208,12 @@ class LangGraphResearchAgent:
         settings: LLMSettings | None = None,
         provider: str | None = None,
         model: str | None = None,
+        dataset_registry: DatasetRegistry | None = None,
         max_tool_retries: int = DEFAULT_MAX_TOOL_RETRIES,
         max_graph_steps: int = DEFAULT_MAX_GRAPH_STEPS,
     ) -> None:
         self.settings = settings or create_llm_settings(provider=provider, model=model)
+        self.dataset_registry = dataset_registry or EmptyDatasetRegistry()
         self.max_tool_retries = max_tool_retries
         self.max_graph_steps = max_graph_steps
         self.graph = self._build_graph()
@@ -283,6 +294,7 @@ class LangGraphResearchAgent:
         graph.add_node("validate_intent", self._validate_intent_tool)
         graph.add_node("design_research", self._design_research_tool)
         graph.add_node("target_dataset_structure", self._target_dataset_tool)
+        graph.add_node("search_and_build_plan", self._search_build_plan_tool)
 
         graph.add_edge(START, "agent")
         graph.add_conditional_edges(
@@ -294,6 +306,7 @@ class LangGraphResearchAgent:
                 "validate_intent": "validate_intent",
                 "design_research": "design_research",
                 "target_dataset_structure": "target_dataset_structure",
+                "search_and_build_plan": "search_and_build_plan",
                 END: END,
             },
         )
@@ -302,6 +315,7 @@ class LangGraphResearchAgent:
         graph.add_edge("validate_intent", "agent")
         graph.add_edge("design_research", "agent")
         graph.add_edge("target_dataset_structure", "agent")
+        graph.add_edge("search_and_build_plan", "agent")
         return graph.compile()
 
     def _agent_node(self, state: ResearchAgentState) -> ResearchAgentState:
@@ -345,11 +359,13 @@ class LangGraphResearchAgent:
             next_node = "design_research"
         elif not state.get("target_dataset_structure"):
             next_node = "target_dataset_structure"
+        elif not state.get("dataset_match_report"):
+            next_node = "search_and_build_plan"
         else:
             return {
                 "graph_steps": graph_steps,
                 "result": OrchestrationResult(
-                    status=OrchestrationStatus.DESIGN_READY,
+                    status=OrchestrationStatus.BUILD_PLAN_READY,
                     intent=state["intent"],
                     clarification_requests=(
                         []
@@ -358,6 +374,7 @@ class LangGraphResearchAgent:
                     ),
                     research_design=state["research_design"],
                     target_dataset_structure=state["target_dataset_structure"],
+                    dataset_match_report=state["dataset_match_report"],
                 ),
                 "next_node": END,
             }
@@ -385,6 +402,8 @@ class LangGraphResearchAgent:
                     "intent": intent,
                     "readiness": None,
                     "research_design": None,
+                    "target_dataset_structure": None,
+                    "dataset_match_report": None,
                 }
             )
         except Exception as exc:
@@ -408,6 +427,8 @@ class LangGraphResearchAgent:
                     "refined_done": True,
                     "readiness": None,
                     "research_design": None,
+                    "target_dataset_structure": None,
+                    "dataset_match_report": None,
                 }
             )
         except Exception as exc:
@@ -433,7 +454,14 @@ class LangGraphResearchAgent:
             messages = _build_design_messages_for_state(state)
             raw_output = _create_json_completion(state["settings"], messages)
             design = _parse_design_json(raw_output, state["intent"])
-            return _tool_success(state, {"research_design": design})
+            return _tool_success(
+                state,
+                {
+                    "research_design": design,
+                    "target_dataset_structure": None,
+                    "dataset_match_report": None,
+                },
+            )
         except Exception as exc:
             return _tool_failure(state, tool, attempts, exc, raw_output)
 
@@ -451,10 +479,30 @@ class LangGraphResearchAgent:
             )
             return _tool_success(
                 state,
-                {"target_dataset_structure": target_dataset_structure},
+                {
+                    "target_dataset_structure": target_dataset_structure,
+                    "dataset_match_report": None,
+                },
             )
         except Exception as exc:
             return _tool_failure(state, tool, attempts, exc, raw_output)
+
+    def _search_build_plan_tool(self, state: ResearchAgentState) -> ResearchAgentState:
+        tool = "search_and_build_plan"
+        attempts = _increment_tool_attempts(state, tool)
+        try:
+            dataset_match_report = create_dataset_match_report(
+                intent=state["intent"],
+                design=state["research_design"],
+                target=state["target_dataset_structure"],
+                registry=self.dataset_registry,
+            )
+            return _tool_success(
+                state,
+                {"dataset_match_report": dataset_match_report},
+            )
+        except Exception as exc:
+            return _tool_failure(state, tool, attempts, exc, None)
 
 
 def _increment_tool_attempts(state: ResearchAgentState, tool: str) -> int:

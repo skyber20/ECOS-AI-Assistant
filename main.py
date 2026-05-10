@@ -182,8 +182,16 @@ def _result_to_json(result: OrchestrationResult) -> str:
             if result.target_dataset_structure
             else None
         ),
+        "dataset_match_report": (
+            result.dataset_match_report.model_dump(mode="json")
+            if result.dataset_match_report
+            else None
+        ),
     }
-    if result.status != OrchestrationStatus.DESIGN_READY:
+    if result.status not in {
+        OrchestrationStatus.DESIGN_READY,
+        OrchestrationStatus.BUILD_PLAN_READY,
+    }:
         payload["status"] = result.status.value
     if result.message:
         payload["message"] = result.message
