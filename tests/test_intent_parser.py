@@ -7,7 +7,10 @@ from intent_parser import (
     DataAvailabilityStatus,
     IntentType,
     LLMMode,
+    LLMSettings,
     NextAction,
+    SYSTEM_PROMPT,
+    _create_json_completion,
     _parse_intent_json,
     create_llm_settings,
 )
@@ -205,21 +208,82 @@ class IntentParserSchemaTest(unittest.TestCase):
         self.assertEqual(settings.mode, LLMMode.CHAT_COMPLETIONS)
         self.assertEqual(settings.model, "test-qwen")
 
-    def test_loads_yandex_prompt_settings_from_env(self) -> None:
+    def test_loads_yandex_chat_settings_from_env(self) -> None:
         env = {
             "LLM_PROVIDER": "yandex",
             "YANDEX_API_KEY": "test-key",
             "YANDEX_BASE_URL": "https://ai.api.cloud.yandex.net/v1",
             "YANDEX_PROJECT": "test-project",
-            "YANDEX_PROMPT_ID": "test-prompt",
+            "YANDEX_MODEL": "gpt://test-project/yandexgpt/latest",
         }
 
         with patch.dict("os.environ", env, clear=True):
             settings = create_llm_settings()
 
         self.assertEqual(settings.provider, "yandex")
-        self.assertEqual(settings.mode, LLMMode.RESPONSES_PROMPT)
-        self.assertEqual(settings.prompt_id, "test-prompt")
+        self.assertEqual(settings.mode, LLMMode.CHAT_COMPLETIONS)
+        self.assertEqual(settings.model, "gpt://test-project/yandexgpt/latest")
+
+    def test_yandex_defaults_model_from_project(self) -> None:
+        env = {
+            "LLM_PROVIDER": "yandex",
+            "YANDEX_API_KEY": "test-key",
+            "YANDEX_BASE_URL": "https://ai.api.cloud.yandex.net/v1",
+            "YANDEX_PROJECT": "test-project",
+        }
+
+        with patch.dict("os.environ", env, clear=True):
+            settings = create_llm_settings()
+
+        self.assertEqual(settings.provider, "yandex")
+        self.assertEqual(settings.mode, LLMMode.CHAT_COMPLETIONS)
+        self.assertEqual(settings.model, "gpt://test-project/yandexgpt/latest")
+
+    def test_chat_completion_sends_system_prompt_and_json_format(self) -> None:
+        class FakeCompletions:
+            def __init__(self) -> None:
+                self.request = None
+
+            def create(self, **kwargs):
+                self.request = kwargs
+
+                class Message:
+                    content = "{}"
+
+                class Choice:
+                    message = Message()
+
+                class Response:
+                    choices = [Choice()]
+
+                return Response()
+
+        class FakeChat:
+            def __init__(self) -> None:
+                self.completions = FakeCompletions()
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.chat = FakeChat()
+
+        client = FakeClient()
+        settings = LLMSettings(
+            provider="yandex",
+            client=client,
+            mode=LLMMode.CHAT_COMPLETIONS,
+            model="gpt://test-project/yandexgpt/latest",
+        )
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "Покажи инфляцию России за 2020-2024."},
+        ]
+
+        _create_json_completion(settings, messages)
+
+        request = client.chat.completions.request
+        self.assertEqual(request["messages"][0]["role"], "system")
+        self.assertIn("ResearchIntent", request["messages"][0]["content"])
+        self.assertEqual(request["response_format"], {"type": "json_object"})
 
     def test_rejects_unknown_provider(self) -> None:
         with patch.dict("os.environ", {"LLM_PROVIDER": "openai"}, clear=True):

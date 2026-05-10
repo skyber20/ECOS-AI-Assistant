@@ -1,11 +1,24 @@
 import argparse
 import json
 import sys
+from typing import TextIO
 
 from openai import OpenAIError
 
 from intent_parser import IntentParserError, parse_research_intent
-from research_designer import ResearchDesignerError, design_research
+from orchestrator import (
+    ClarificationAnswer,
+    ClarificationRequest,
+    OrchestrationResult,
+    OrchestrationStatus,
+    continue_research_flow,
+    prepare_intent_for_design,
+    refine_intent_with_clarifications,
+)
+from research_designer import ResearchDesignerError
+
+
+MAX_CLARIFICATION_ROUNDS = 3
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,27 +50,12 @@ def main() -> None:
         query = input("Опишите исследовательскую задачу: ").strip()
 
     try:
-        print("запустился 1 этап перевода в формальный запрос", file=sys.stderr, flush=True)
-        intent = parse_research_intent(
+        result = run_interactive_research_flow(
             query,
             provider=args.provider,
             model=args.model,
         )
-        print("завершился 1 этап перевода в формальный запрос", file=sys.stderr, flush=True)
-        print("запустился 2 этап построения дизайна исследования", file=sys.stderr, flush=True)
-        design = design_research(
-            intent,
-            provider=args.provider,
-            model=args.model,
-        )
-        print(json.dumps(
-            {
-                "intent": intent.model_dump(mode="json"),
-                "research_design": design.model_dump(mode="json"),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ))
+        print(_result_to_json(result))
         return
     except (
         RuntimeError,
@@ -68,6 +66,150 @@ def main() -> None:
     ) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
+
+
+def run_interactive_research_flow(
+    query: str,
+    provider: str | None = None,
+    model: str | None = None,
+    input_stream: TextIO | None = None,
+    error_stream: TextIO | None = None,
+    max_clarification_rounds: int = MAX_CLARIFICATION_ROUNDS,
+) -> OrchestrationResult:
+    input_stream = input_stream or sys.stdin
+    error_stream = error_stream or sys.stderr
+
+    print("запустился 1 этап перевода в формальный запрос", file=error_stream, flush=True)
+    intent = parse_research_intent(
+        query,
+        provider=provider,
+        model=model,
+    )
+    print("завершился 1 этап перевода в формальный запрос", file=error_stream, flush=True)
+
+    for round_number in range(1, max_clarification_rounds + 1):
+        readiness = prepare_intent_for_design(intent)
+        if readiness.status == OrchestrationStatus.READY_FOR_DESIGN:
+            print("запустился 2 этап построения дизайна исследования", file=error_stream, flush=True)
+            return continue_research_flow(
+                intent,
+                provider=provider,
+                model=model,
+            )
+
+        if readiness.status != OrchestrationStatus.NEEDS_CLARIFICATION:
+            return readiness
+
+        print(
+            f"нужно дозаполнить основной контракт перед 2 этапом "
+            f"(раунд {round_number}/{max_clarification_rounds})",
+            file=error_stream,
+            flush=True,
+        )
+        answers = _collect_clarification_answers(
+            readiness.clarification_requests,
+            input_stream=input_stream,
+            error_stream=error_stream,
+        )
+        print("обновляю основной контракт с уточнениями пользователя", file=error_stream, flush=True)
+        intent = refine_intent_with_clarifications(
+            intent,
+            answers,
+            provider=provider,
+            model=model,
+        )
+
+    readiness = prepare_intent_for_design(intent)
+    if readiness.status == OrchestrationStatus.READY_FOR_DESIGN:
+        print("запустился 2 этап построения дизайна исследования", file=error_stream, flush=True)
+        return continue_research_flow(
+            intent,
+            provider=provider,
+            model=model,
+        )
+
+    missing_fields = ", ".join(request.field for request in readiness.clarification_requests)
+    raise RuntimeError(
+        "Не удалось дозаполнить основной контракт перед 2 этапом. "
+        f"Остались поля: {missing_fields or readiness.status.value}."
+    )
+
+
+def _collect_clarification_answers(
+    requests: list[ClarificationRequest],
+    input_stream: TextIO,
+    error_stream: TextIO,
+) -> list[ClarificationAnswer]:
+    answers: list[ClarificationAnswer] = []
+    for index, request in enumerate(requests, start=1):
+        print("", file=error_stream)
+        print(f"Уточнение {index}/{len(requests)}: {request.question}", file=error_stream)
+        print(f"Поле: {request.field}. Причина: {request.reason}", file=error_stream)
+        if request.default_assumption:
+            print(
+                f"Можно нажать Enter, чтобы использовать default: {request.default_assumption}",
+                file=error_stream,
+            )
+
+        answer, used_default = _read_required_answer(
+            request,
+            input_stream=input_stream,
+            error_stream=error_stream,
+        )
+        answers.append(
+            ClarificationAnswer(
+                field=request.field,
+                question=request.question,
+                answer=answer,
+                used_default=used_default,
+            )
+        )
+
+    return answers
+
+
+def _read_required_answer(
+    request: ClarificationRequest,
+    input_stream: TextIO,
+    error_stream: TextIO,
+) -> tuple[str, bool]:
+    while True:
+        print("Ответ: ", end="", file=error_stream, flush=True)
+        line = input_stream.readline()
+        if line == "":
+            raise RuntimeError(
+                "Невозможно дозаполнить основной контракт: поток ввода закрыт."
+            )
+
+        answer = line.strip()
+        if answer:
+            return answer, False
+        if request.default_assumption:
+            return request.default_assumption, True
+
+        print("Ответ обязателен, чтобы перейти ко 2 этапу.", file=error_stream)
+
+
+def _result_to_json(result: OrchestrationResult) -> str:
+    payload = {
+        "intent": result.intent.model_dump(mode="json"),
+        "research_design": (
+            result.research_design.model_dump(mode="json")
+            if result.research_design
+            else None
+        ),
+    }
+    if result.status != OrchestrationStatus.DESIGN_READY:
+        payload["status"] = result.status.value
+    if result.message:
+        payload["message"] = result.message
+    if result.clarification_requests:
+        payload["clarification_requests"] = [
+            request.model_dump(mode="json")
+            for request in result.clarification_requests
+        ]
+
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":

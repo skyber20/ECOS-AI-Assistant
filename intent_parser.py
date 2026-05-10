@@ -69,7 +69,6 @@ class DataAvailabilityStatus(str, Enum):
 
 class LLMMode(str, Enum):
     CHAT_COMPLETIONS = "chat_completions"
-    RESPONSES_PROMPT = "responses_prompt"
 
 
 @dataclass(frozen=True)
@@ -78,7 +77,6 @@ class LLMSettings:
     client: OpenAI
     mode: LLMMode
     model: str | None = None
-    prompt_id: str | None = None
 
 
 class TimeRange(BaseModel):
@@ -415,41 +413,26 @@ def _create_yandex_settings(model: str | None = None) -> LLMSettings:
     api_key = _get_env("YANDEX_API_KEY")
     base_url = _get_env("YANDEX_BASE_URL") or "https://ai.api.cloud.yandex.net/v1"
     project = _get_env("YANDEX_PROJECT")
-    prompt_id = _get_env("YANDEX_PROMPT_ID")
-    llm_model = model or _get_env("YANDEX_MODEL")
-    api_mode = (_get_env("YANDEX_API_MODE") or "").lower()
+    llm_model = model or _get_env("YANDEX_MODEL") or (
+        f"gpt://{project}/yandexgpt/latest" if project else None
+    )
 
     if not api_key:
         raise RuntimeError("YANDEX_API_KEY is not set. Add it to your .env file.")
+    if not llm_model:
+        raise RuntimeError(
+            "YANDEX_MODEL is not set. Add it to your .env file."
+        )
 
     client_kwargs: dict[str, str] = {"api_key": api_key, "base_url": base_url}
     if project:
         client_kwargs["project"] = project
 
-    if api_mode in {"responses", "prompt", "responses_prompt"}:
-        mode = LLMMode.RESPONSES_PROMPT
-    elif api_mode in {"chat", "chat_completions"}:
-        mode = LLMMode.CHAT_COMPLETIONS
-    elif llm_model:
-        mode = LLMMode.CHAT_COMPLETIONS
-    else:
-        mode = LLMMode.RESPONSES_PROMPT
-
-    if mode == LLMMode.CHAT_COMPLETIONS and not llm_model:
-        raise RuntimeError(
-            "YANDEX_MODEL is required when YANDEX_API_MODE=chat."
-        )
-    if mode == LLMMode.RESPONSES_PROMPT and not prompt_id:
-        raise RuntimeError(
-            "YANDEX_PROMPT_ID is required when using Yandex responses_prompt mode."
-        )
-
     return LLMSettings(
         provider="yandex",
         client=OpenAI(**client_kwargs),
-        mode=mode,
+        mode=LLMMode.CHAT_COMPLETIONS,
         model=llm_model,
-        prompt_id=prompt_id,
     )
 
 
@@ -496,9 +479,6 @@ def _create_json_completion(
     settings: LLMSettings,
     messages: list[dict[str, str]],
 ) -> str:
-    if settings.mode == LLMMode.RESPONSES_PROMPT:
-        return _create_responses_prompt_completion(settings, messages)
-
     if not settings.model:
         raise IntentParserError("LLM model is not configured.")
 
@@ -519,41 +499,6 @@ def _create_json_completion(
     if not content:
         raise IntentParserError("LLM returned an empty response.")
     return content
-
-
-def _create_responses_prompt_completion(
-    settings: LLMSettings,
-    messages: list[dict[str, str]],
-) -> str:
-    if not settings.prompt_id:
-        raise IntentParserError("Yandex prompt id is not configured.")
-
-    response = settings.client.responses.create(
-        prompt={"id": settings.prompt_id},
-        input=_messages_to_prompt_input(messages),
-    )
-
-    content = getattr(response, "output_text", None)
-    if not content:
-        raise IntentParserError("LLM returned an empty response.")
-    return content
-
-
-def _messages_to_prompt_input(messages: list[dict[str, str]]) -> str:
-    system_message = next(
-        (message["content"] for message in messages if message["role"] == "system"),
-        "",
-    )
-    user_message = next(
-        (message["content"] for message in messages if message["role"] == "user"),
-        "",
-    )
-
-    return (
-        f"{system_message}\n\n"
-        f"Пользовательский запрос:\n{user_message}\n\n"
-        "Верни только один JSON-объект по схеме выше."
-    )
 
 
 def _parse_intent_json(content: str, original_query: str) -> ResearchIntent:
