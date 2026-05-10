@@ -1,11 +1,6 @@
 import streamlit as st
-import time
-import re
-import io
-import sys
-from typing import List, Dict
-import traceback
 import requests
+import json
 
 API_URL = "http://localhost:8000"
 
@@ -17,316 +12,320 @@ st.set_page_config(
 
 st.title("🤖 ECOS AI Assistant")
 
+# Состояния
+if "status" not in st.session_state:
+    st.session_state.status = "Готов к запросу"
+if "clarification_requests" not in st.session_state:
+    st.session_state.clarification_requests = []
+if "result" not in st.session_state:
+    st.session_state.result = None
+if "is_processing" not in st.session_state:
+    st.session_state.is_processing = False
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "is_generating" not in st.session_state:
-    st.session_state.is_generating = False
-if "code_outputs" not in st.session_state:
-    st.session_state.code_outputs = {}
+if "current_question" not in st.session_state:
+    st.session_state.current_question = None
+if "clarification_answers" not in st.session_state:
+    st.session_state.clarification_answers = []
+if "trigger_send" not in st.session_state:
+    st.session_state.trigger_send = False
+if "trigger_submit" not in st.session_state:
+    st.session_state.trigger_submit = False
+if "trigger_skip" not in st.session_state:
+    st.session_state.trigger_skip = False
+if "trigger_clear" not in st.session_state:
+    st.session_state.trigger_clear = False
 
-def extract_code_blocks(text: str) -> List[Dict]:
-    """Извлекает блоки кода, помеченные >>>"""
-    code_blocks = []
-    pattern = r'>>>(.*?)>>>' ## can change on ``` 
-    matches = re.finditer(pattern, text, re.DOTALL)
-    
-    for match in matches:
-        code = match.group(1).strip()
-        start = match.start()
-        end = match.end()
-        code_blocks.append({
-            'code': code,
-            'start': start,
-            'end': end
-        })
-    
-    return code_blocks
-
-def setup_responsive_plot(fig=None, width=10, height=6):
-    """Настраивает график для адаптивного отображения в Streamlit"""
-    if fig is None:
-        fig = plt.gcf()
-    
-    fig.set_size_inches(width, height)
-    fig.tight_layout()
-    fig.set_dpi(100)
-    
-    return fig
-
-def execute_python_code(code: str) -> tuple:
-    old_stdout = sys.stdout
-    redirected_output = sys.stdout = io.StringIO()
-    
-    try:
-        namespace = {}
-        exec(code, namespace)
-        output = redirected_output.getvalue()
-        
-        import matplotlib.pyplot as plt
-        fig = plt.gcf()
-        
-        if fig.get_axes():
-            fig.set_size_inches(10, 6)
-            fig.tight_layout()
-            return 'plot', fig
-        else:
-            return 'text', output if output else "Код выполнен успешно (нет вывода)"
-            
-    except Exception as e:
-        return 'error', f"Ошибка: {str(e)}\n{traceback.format_exc()}"
-    finally:
-        sys.stdout = old_stdout
-
-
-
-def simulate_llm_response(prompt: str) -> str:
-    response = requests.post(
-        f"{API_URL}/api/agent/run",
-        json={"prompt": prompt}
-    )
-    return response.json()["response"]
-
-# это у нас был мок для проверки вывода графиков
-# def simulate_llm_response(prompt: str) -> str:
-#     """Имитация ответа LLM. Потом заменим на нормальную"""
-#     time.sleep(0.5)
-    
-#     if "график" in prompt.lower() or "plot" in prompt.lower():
-#         return """Вот пример кода для построения графика:
-
-# >>>import matplotlib.pyplot as plt
-# import numpy as np
-
-# x = np.linspace(0, 10, 100)
-# y = np.sin(x)
-
-# plt.figure(figsize=(10, 6))
-# plt.plot(x, y, 'b-', linewidth=2, label='sin(x)')
-# plt.grid(True, alpha=0.3)
-# plt.xlabel('X')
-# plt.ylabel('Y')
-# plt.title('Пример графика')
-# plt.legend()
-# plt.show()>>>
-
-# А вот еще один пример:
-
-# >>>import pandas as pd
-# import matplotlib.pyplot as plt
-
-# data = {'Месяц': ['Янв', 'Фев', 'Мар', 'Апр'],
-#         'Продажи': [100, 150, 130, 180]}
-# df = pd.DataFrame(data)
-
-# fig, ax = plt.subplots(figsize=(8, 5))
-# ax.bar(df['Месяц'], df['Продажи'], color='skyblue')
-# ax.set_title('Продажи по месяцам')
-# ax.set_ylabel('Сумма продаж')
-# plt.show()>>>"""
-    
-#     elif "таблица" in prompt.lower() or "table" in prompt.lower():
-#         return """Вот пример создания таблицы:
-
-# >>>import pandas as pd
-
-# data = {
-#     'Имя': ['Анна', 'Борис', 'Виктор', 'Галина'],
-#     'Возраст': [25, 30, 35, 28],
-#     'Город': ['Москва', 'СПб', 'Казань', 'Новосибирск']
-# }
-# df = pd.DataFrame(data)
-# print(df.to_string())>>>
-
-# И еще пример с вычислениями:
-
-# >>>import pandas as pd
-# import numpy as np
-
-# df = pd.DataFrame({
-#     'A': np.random.randn(10),
-#     'B': np.random.randn(10)
-# })
-# df['Сумма'] = df['A'] + df['B']
-# print("Таблица случайных данных:")
-# print(df.round(3).to_string())
-# print(f"\nСтатистика:")
-# print(df.describe().round(3).to_string())>>>"""
-    
-#     else:
-#         return f"Это ответ ассистента на ваше сообщение: '{prompt}'. (Здесь будет реальный ответ от LLM)"
 
 def send_message():
-    if st.session_state.user_input and not st.session_state.is_generating:
-        st.session_state.messages.append({
-            "role": "user",
-            "content": st.session_state.user_input
-        })
-        st.session_state.is_generating = True
-        st.session_state.user_input = ""
+    """Set flag to process message on next rerun"""
+    if st.session_state.user_input.strip() and not st.session_state.is_processing:
+        st.session_state.trigger_send = True
 
-def stop_generation():
-    st.session_state.is_generating = False
+
+def submit_clarification():
+    """Set flag to process clarification on next rerun"""
+    if st.session_state.clarification_input.strip():
+        st.session_state.trigger_submit = True
+
+
+def skip_with_default():
+    """Set flag to skip current question on next rerun"""
+    if st.session_state.current_question and st.session_state.current_question.get("default_assumption"):
+        st.session_state.trigger_skip = True
+
+
+def clear_all():
+    """Set flag to clear everything on next rerun"""
+    st.session_state.trigger_clear = True
+
+
+# Process triggers in the main flow (not in callbacks)
+if st.session_state.trigger_clear:
+    st.session_state.messages = []
+    st.session_state.result = None
+    st.session_state.status = "Готов к запросу"
+    st.session_state.is_processing = False
+    st.session_state.clarification_requests = []
+    st.session_state.current_question = None
+    st.session_state.clarification_answers = []
+    st.session_state.current_question_index = 0
+    st.session_state.trigger_clear = False
     st.rerun()
 
-def get_llm_response():
-    if st.session_state.is_generating:
-        last_user_message = next(
-            (msg["content"] for msg in reversed(st.session_state.messages) 
-             if msg["role"] == "user"), 
-            None
-        )
-        
-        if last_user_message:
-            response = simulate_llm_response(last_user_message)
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": response
-            })
-        
-        st.session_state.is_generating = False
-        st.rerun()
+if st.session_state.trigger_send:
+    st.session_state.trigger_send = False
+    prompt = st.session_state.user_input.strip()
+    st.session_state.user_input = ""
 
-def run_code(code_id: str, code: str):
-    """Сохраняет результат выполнения кода в session_state"""
-    result_type, result = execute_python_code(code)
-    st.session_state.code_outputs[code_id] = {
-        'type': result_type,
-        'result': result ## убрать к ебеной матери эту функцию  
-    }
+    st.session_state.messages.append({
+        "role": "user",
+        "content": prompt
+    })
+    st.session_state.status = "Анализ запроса..."
+    st.session_state.is_processing = True
+    st.rerun()
 
+if st.session_state.trigger_submit:
+    st.session_state.trigger_submit = False
+    answer = st.session_state.clarification_input.strip()
+    st.session_state.clarification_input = ""
+
+    current = st.session_state.current_question
+    st.session_state.clarification_answers.append({
+        "field": current["field"],
+        "question": current["question"],
+        "answer": answer,
+        "used_default": False
+    })
+
+    # Переход к следующему вопросу
+    idx = st.session_state.current_question_index + 1
+    if idx < len(st.session_state.clarification_requests):
+        st.session_state.current_question_index = idx
+        st.session_state.current_question = st.session_state.clarification_requests[idx]
+        st.session_state.status = f"Уточнение {idx + 1}/{len(st.session_state.clarification_requests)}"
+    else:
+        # Отправляем ответы на бекенд
+        st.session_state.status = "Отправка уточнений..."
+        st.session_state.is_processing = True
+    st.rerun()
+
+if st.session_state.trigger_skip:
+    st.session_state.trigger_skip = False
+    current = st.session_state.current_question
+    if current.get("default_assumption"):
+        st.session_state.clarification_answers.append({
+            "field": current["field"],
+            "question": current["question"],
+            "answer": current["default_assumption"],
+            "used_default": True
+        })
+
+    idx = st.session_state.current_question_index + 1
+    if idx < len(st.session_state.clarification_requests):
+        st.session_state.current_question_index = idx
+        st.session_state.current_question = st.session_state.clarification_requests[idx]
+        st.session_state.status = f"Уточнение {idx + 1}/{len(st.session_state.clarification_requests)}"
+    else:
+        st.session_state.status = "Отправка уточнений..."
+        st.session_state.is_processing = True
+    st.rerun()
+
+
+def send_clarification_answers():
+    try:
+        response = requests.post(
+            f"{API_URL}/api/agent/clarify",
+            json={
+                "answers": st.session_state.clarification_answers
+            }
+        ).json()
+
+        handle_api_response(response)
+    except Exception as e:
+        st.error(f"Ошибка соединения: {e}")
+        st.session_state.status = "Ошибка"
+        st.session_state.is_processing = False
+
+
+def handle_api_response(response: dict):
+    status = response.get("status")
+
+    if status == "design_ready":
+        st.session_state.result = response.get("result")
+        response_text = response.get("response", "Готово")
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": response_text,
+            "result": response.get("result")
+        })
+        st.session_state.status = "Готов к запросу"
+        st.session_state.clarification_requests = []
+        st.session_state.current_question = None
+        st.session_state.clarification_answers = []
+
+    elif status == "needs_clarification":
+        st.session_state.clarification_requests = response.get("clarification_requests", [])
+        st.session_state.current_question_index = 0
+        st.session_state.current_question = st.session_state.clarification_requests[0] if st.session_state.clarification_requests else None
+        st.session_state.clarification_answers = []
+        st.session_state.status = f"Уточнение 1/{len(st.session_state.clarification_requests)}" if st.session_state.clarification_requests else "Готов к запросу"
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": response.get("response", "Нужны уточнения.")
+        })
+
+    else:
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": response.get("response", response.get("error", "Неизвестный статус"))
+        })
+        st.session_state.status = "Готов к запросу"
+
+    st.session_state.is_processing = False
+
+
+def process_initial_request():
+    last_user_message = next(
+        (msg["content"] for msg in reversed(st.session_state.messages)
+         if msg["role"] == "user"),
+        None
+    )
+
+    if not last_user_message:
+        st.session_state.is_processing = False
+        return
+
+    try:
+        response = requests.post(
+            f"{API_URL}/api/agent/run",
+            json={"prompt": last_user_message}
+        ).json()
+
+        handle_api_response(response)
+    except Exception as e:
+        st.error(f"Ошибка соединения: {e}")
+        st.session_state.status = "Ошибка"
+        st.session_state.is_processing = False
+
+
+# Основная логика
+if st.session_state.is_processing and not st.session_state.clarification_answers:
+    process_initial_request()
+    st.rerun()
+
+if st.session_state.is_processing and st.session_state.clarification_answers:
+    send_clarification_answers()
+    st.rerun()
+
+# Интерфейс
 chat_container = st.container()
 
 with chat_container:
-    for idx, message in enumerate(st.session_state.messages):
+    for message in st.session_state.messages:
         if message["role"] == "user":
             with st.chat_message("user"):
                 st.write(message["content"])
         else:
             with st.chat_message("assistant"):
-                code_blocks = extract_code_blocks(message["content"])
-                
-                if code_blocks:
-                    last_pos = 0
-                    for block_idx, block in enumerate(code_blocks):
-                        if block['start'] > last_pos:
-                            text_part = message["content"][last_pos:block['start']]
-                            if text_part.strip():
-                                st.write(text_part.strip())
+                st.write(message["content"])
+                if message.get("result"):
+                    with st.expander("📋 Дизайн исследования (JSON)", expanded=True):
+                        st.json(message["result"])
 
-                        code_id = f"code_{idx}_{block_idx}"
-                        
-
-                        with st.container():
-                            st.code(block['code'], language='python')
-                            col1, col2 = st.columns([1, 4])
-                            with col1:
-                                if st.button("▶️ Запустить", key=f"run_{code_id}"):
-                                    run_code(code_id, block['code'])
-                                    st.rerun()
-                            
-
-                            if code_id in st.session_state.code_outputs:
-                                output = st.session_state.code_outputs[code_id]
-                                with st.expander("📊 Результат выполнения", expanded=True):
-                                    if output['type'] == 'plot':
-                                        st.pyplot(output['result'])
-                                    elif output['type'] == 'text':
-                                        st.text(output['result'])
-                                    elif output['type'] == 'error':
-                                        st.error(output['result'])
-                        
-                        last_pos = block['end']
-                    
-                    if last_pos < len(message["content"]):
-                        remaining_text = message["content"][last_pos:]
-                        if remaining_text.strip():
-                            st.write(remaining_text.strip())
-                else:
-                    st.write(message["content"])
-    
-    if st.session_state.is_generating:
+    if st.session_state.is_processing and not st.session_state.clarification_answers:
         with st.chat_message("assistant"):
-            st.write("✍️ Печатает...")
+            st.write("✍️ Анализирую запрос...")
 
-with st.container():
+# Поле ввода или уточнений
+st.divider()
+
+if st.session_state.current_question is not None:
+    # Режим уточнений
+    st.info(f"**{st.session_state.status}**")
+    question = st.session_state.current_question
+    with st.container():
+        st.markdown(f"### ❓ {question['question']}")
+        st.caption(f"Поле: {question['field']}. Причина: {question['reason']}")
+        if question.get("default_assumption"):
+            st.caption(f"Default: {question['default_assumption']}")
+
+        col1, col2, col3 = st.columns([4, 1, 1])
+        with col1:
+            st.text_input(
+                "Ваш ответ:",
+                key="clarification_input",
+                placeholder="Введите ответ или нажмите Пропустить для default",
+            )
+        with col2:
+            st.button(
+                "📤 Ответить",
+                on_click=submit_clarification,
+                use_container_width=True,
+                disabled=not st.session_state.get("clarification_input", "")
+            )
+        with col3:
+            st.button(
+                "⏭️ Пропустить",
+                on_click=skip_with_default,
+                use_container_width=True,
+                disabled=not question.get("default_assumption"),
+                type="secondary"
+            )
+
+elif not st.session_state.is_processing:
+    # Обычный режим ввода
     col1, col2, col3 = st.columns([4, 1, 1])
-    
     with col1:
         st.text_input(
             "Введите сообщение...",
             key="user_input",
-            disabled=st.session_state.is_generating,
-            on_change=send_message,
-            placeholder="Напишите что-нибудь..."
+            placeholder="Напишите исследовательский запрос..."
         )
-    
     with col2:
         st.button(
             "📤 Отправить",
             on_click=send_message,
-            disabled=st.session_state.is_generating or not st.session_state.get("user_input", ""),
+            disabled=st.session_state.is_processing or not st.session_state.get("user_input", ""),
             use_container_width=True
         )
-    
     with col3:
         st.button(
-            "⏹️ Стоп",
-            on_click=stop_generation,
-            disabled=not st.session_state.is_generating,
+            "⏹️ Очистить",
+            on_click=clear_all,
             use_container_width=True,
             type="secondary"
         )
 
-if st.session_state.is_generating:
-    get_llm_response()
 
+# Боковая панель
 with st.sidebar:
     st.header("ℹ️ Информация")
-    st.write("**Статус:**", "Генерация..." if st.session_state.is_generating else "Готов")
+    st.write("**Статус:**", st.session_state.status)
     st.write("**Сообщений в чате:**", len(st.session_state.messages))
-    st.write("**Выполненных кодов:**", len(st.session_state.code_outputs))
-    
+
     st.divider()
-    
-    if st.button("🗑️ Очистить все", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.code_outputs = {}
-        st.session_state.is_generating = False
-        st.rerun()
-    
+
+    if st.button("🗑️ Очистить всё", use_container_width=True, on_click=clear_all):
+        pass
+
     st.divider()
-    
+    st.subheader("💡 Подсказка")
+    st.write("Введите исследовательский запрос. Если нужны уточнения, ответьте на вопросы.")
+    st.write("После завершения вы получите готовый дизайн исследования в JSON.")
 
-st.subheader("Поддерживаемые для отображения результата выполнения кода библиотеки")
-st.write("• matplotlib")
-st.write("• pandas")
-st.write("• numpy")
-st.write("• Все стандартные библиотеки Python")
-
-st.divider()
-st.caption("💡 Сейчас стоит заглушка в бекенде, которую надо будет изменить")
-
-# CSS стили
 st.markdown("""
 <style>
 .stTextInput > div > div > input {
     font-size: 16px;
 }
-
 .stChatMessage {
     margin-bottom: 10px;
 }
-
 .main .block-container {
     padding-top: 1rem;
     padding-bottom: 0rem;
-}
-
-/* Стиль для блоков кода */
-.stCodeBlock {
-    border: 1px solid #e0e0e0;
-    border-radius: 5px;
-    margin: 10px 0;
 }
 </style>
 """, unsafe_allow_html=True)
