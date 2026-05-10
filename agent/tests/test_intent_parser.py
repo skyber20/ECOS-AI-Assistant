@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from intent_parser import (
+from agent.intent_parser import (
     Complexity,
     DataAvailabilityStatus,
     IntentType,

@@ -1,8 +1,8 @@
 import json
 import unittest
 
-from dataset_search_planner import BuildStrategy
-from intent_parser import (
+from agent.dataset_search_planner import BuildStrategy
+from agent.intent_parser import (
     Complexity,
     DatasetSpec,
     IndicatorSpec,
@@ -13,7 +13,7 @@ from intent_parser import (
     ResearchIntent,
     TimeRange,
 )
-from orchestrator import (
+from agent.orchestrator import (
     ClarificationAnswer,
     LangGraphResearchAgent,
     OrchestrationStatus,

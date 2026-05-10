@@ -2,7 +2,7 @@ import io
 import unittest
 from unittest.mock import patch
 
-from intent_parser import (
+from agent.intent_parser import (
     Complexity,
     DatasetSpec,
     IndicatorSpec,
@@ -11,8 +11,8 @@ from intent_parser import (
     ResearchIntent,
     TimeRange,
 )
-from main import run_interactive_research_flow
-from orchestrator import OrchestrationResult, OrchestrationStatus
+from agent.main import run_interactive_research_flow
+from agent.orchestrator import OrchestrationResult, OrchestrationStatus
 
 
 class MainFlowTest(unittest.TestCase):

@@ -3,7 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from intent_parser import (
+from agent.intent_parser import (
     IntentParserError,
     IntentType,
     NextAction,

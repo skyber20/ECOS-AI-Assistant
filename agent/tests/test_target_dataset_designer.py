@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from intent_parser import (
+from agent.intent_parser import (
     Complexity,
     DatasetSpec,
     IndicatorSpec,
@@ -10,8 +10,8 @@ from intent_parser import (
     ResearchIntent,
     TimeRange,
 )
-from research_designer import ResearchStudyDesign
-from target_dataset_designer import (
+from agent.research_designer import ResearchStudyDesign
+from agent.target_dataset_designer import (
     _parse_target_dataset_json,
     build_target_dataset_messages,
 )

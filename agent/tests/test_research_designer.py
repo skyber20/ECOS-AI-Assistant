@@ -1,8 +1,8 @@
 import json
 import unittest
 
-from intent_parser import Complexity, IntentType, NextAction, ResearchIntent, TimeRange
-from research_designer import _parse_design_json, build_research_design_messages
+from agent.intent_parser import Complexity, IntentType, NextAction, ResearchIntent, TimeRange
+from agent.research_designer import _parse_design_json, build_research_design_messages
 
 
 class ResearchDesignerSchemaTest(unittest.TestCase):

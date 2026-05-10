@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 
-from orchestrator import LangGraphResearchAgent
+from agent.orchestrator import LangGraphResearchAgent
 
 load_dotenv()
 

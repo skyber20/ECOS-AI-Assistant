@@ -3,7 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from intent_parser import (
+from agent.intent_parser import (
     IntentParserError,
     IntentType,
     NextAction,
@@ -11,7 +11,7 @@ from intent_parser import (
     _load_json_object,
     none_to_empty_list,
 )
-from research_designer import ResearchStudyDesign
+from agent.research_designer import ResearchStudyDesign
 
 
 class DatasetColumn(BaseModel):
