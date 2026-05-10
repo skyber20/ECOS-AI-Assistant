@@ -35,6 +35,8 @@ if "trigger_skip" not in st.session_state:
     st.session_state.trigger_skip = False
 if "trigger_clear" not in st.session_state:
     st.session_state.trigger_clear = False
+if "session_id" not in st.session_state:
+    st.session_state.session_id = None
 
 
 def send_message():
@@ -70,6 +72,7 @@ if st.session_state.trigger_clear:
     st.session_state.current_question = None
     st.session_state.clarification_answers = []
     st.session_state.current_question_index = 0
+    st.session_state.session_id = None
     st.session_state.trigger_clear = False
     st.rerun()
 
@@ -138,48 +141,113 @@ def send_clarification_answers():
         response = requests.post(
             f"{API_URL}/api/agent/clarify",
             json={
+                "session_id": st.session_state.session_id,
                 "answers": st.session_state.clarification_answers
-            }
+            },
+            timeout=30
         ).json()
 
         handle_api_response(response)
     except Exception as e:
         st.error(f"Ошибка соединения: {e}")
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": f"❌ Не удалось соединиться с сервером. Попробуйте ещё раз. ({str(e)})"
+        })
         st.session_state.status = "Ошибка"
         st.session_state.is_processing = False
 
 
 def handle_api_response(response: dict):
-    status = response.get("status")
-
-    if status == "design_ready":
-        st.session_state.result = response.get("result")
-        response_text = response.get("response", "Готово")
+    # Проверка на null/None ответ
+    if response is None:
         st.session_state.messages.append({
             "role": "assistant",
-            "content": response_text,
-            "result": response.get("result")
+            "content": "❌ Сервер вернул пустой ответ. Возможно, произошла внутренняя ошибка. Попробуйте переформулировать запрос."
         })
+        st.session_state.status = "Готов к запросу"
+        st.session_state.is_processing = False
+        st.session_state.clarification_requests = []
+        st.session_state.current_question = None
+        st.session_state.clarification_answers = []
+        return
+
+    status = response.get("status")
+    
+    # Сохраняем session_id если пришел
+    if response.get("session_id"):
+        st.session_state.session_id = response["session_id"]
+
+    # Обработка ошибок
+    if status == "error":
+        error_msg = response.get("error", "Неизвестная ошибка")
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": f"❌ Произошла ошибка: {error_msg}"
+        })
+        st.session_state.status = "Готов к запросу"
+        st.session_state.is_processing = False
+        st.session_state.clarification_requests = []
+        st.session_state.current_question = None
+        st.session_state.clarification_answers = []
+        return
+
+    # Обработка design_ready
+    if status == "design_ready":
+        result = response.get("result")
+        if result is None:
+            # Если result = null, но статус design_ready
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "✅ Дизайн исследования создан, но результат не содержит данных. Возможно, запрос требует уточнения."
+            })
+        else:
+            st.session_state.result = result
+            response_text = response.get("response", "Готово")
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": response_text,
+                "result": result
+            })
         st.session_state.status = "Готов к запросу"
         st.session_state.clarification_requests = []
         st.session_state.current_question = None
         st.session_state.clarification_answers = []
 
+    # Обработка needs_clarification
     elif status == "needs_clarification":
-        st.session_state.clarification_requests = response.get("clarification_requests", [])
+        clarification_requests = response.get("clarification_requests", [])
+        if not clarification_requests:
+            # Если запрошены уточнения, но список пуст
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "ℹ️ Требуются уточнения, но система не смогла сформулировать вопросы. Попробуйте описать задачу подробнее."
+            })
+            st.session_state.status = "Готов к запросу"
+            st.session_state.is_processing = False
+            return
+        
+        st.session_state.clarification_requests = clarification_requests
         st.session_state.current_question_index = 0
-        st.session_state.current_question = st.session_state.clarification_requests[0] if st.session_state.clarification_requests else None
+        st.session_state.current_question = clarification_requests[0]
         st.session_state.clarification_answers = []
-        st.session_state.status = f"Уточнение 1/{len(st.session_state.clarification_requests)}" if st.session_state.clarification_requests else "Готов к запросу"
+        st.session_state.status = f"Уточнение 1/{len(clarification_requests)}"
         st.session_state.messages.append({
             "role": "assistant",
             "content": response.get("response", "Нужны уточнения.")
         })
 
+    # Обработка других статусов
     else:
+        response_text = response.get("response") or response.get("error") or "Неизвестный статус"
+        if response_text is None:
+            response_text = "ℹ️ Получен ответ от сервера, но текст сообщения отсутствует."
+        
+        result = response.get("result")
         st.session_state.messages.append({
             "role": "assistant",
-            "content": response.get("response", response.get("error", "Неизвестный статус"))
+            "content": response_text,
+            "result": result if result else None
         })
         st.session_state.status = "Готов к запросу"
 
@@ -200,13 +268,34 @@ def process_initial_request():
     try:
         response = requests.post(
             f"{API_URL}/api/agent/run",
-            json={"prompt": last_user_message}
+            json={
+                "prompt": last_user_message,
+                "session_id": st.session_state.session_id
+            },
+            timeout=30
         ).json()
 
         handle_api_response(response)
+    except requests.exceptions.Timeout:
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "⏰ Превышено время ожидания ответа от сервера. Попробуйте упростить запрос."
+        })
+        st.session_state.status = "Готов к запросу"
+        st.session_state.is_processing = False
+    except requests.exceptions.ConnectionError:
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "🔌 Не удалось подключиться к серверу. Убедитесь, что API запущен."
+        })
+        st.session_state.status = "Готов к запросу"
+        st.session_state.is_processing = False
     except Exception as e:
-        st.error(f"Ошибка соединения: {e}")
-        st.session_state.status = "Ошибка"
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": f"❌ Непредвиденная ошибка: {str(e)}"
+        })
+        st.session_state.status = "Готов к запросу"
         st.session_state.is_processing = False
 
 
@@ -276,7 +365,7 @@ if st.session_state.current_question is not None:
 
 elif not st.session_state.is_processing:
     # Обычный режим ввода
-    col1, col2, col3 = st.columns([4, 1, 1])
+    col1, col2 = st.columns([4, 1])
     with col1:
         st.text_input(
             "Введите сообщение...",
@@ -290,13 +379,6 @@ elif not st.session_state.is_processing:
             disabled=st.session_state.is_processing or not st.session_state.get("user_input", ""),
             use_container_width=True
         )
-    with col3:
-        st.button(
-            "⏹️ Очистить",
-            on_click=clear_all,
-            use_container_width=True,
-            type="secondary"
-        )
 
 
 # Боковая панель
@@ -304,6 +386,8 @@ with st.sidebar:
     st.header("ℹ️ Информация")
     st.write("**Статус:**", st.session_state.status)
     st.write("**Сообщений в чате:**", len(st.session_state.messages))
+    if st.session_state.session_id:
+        st.write("**Сессия:**", st.session_state.session_id[:8] + "...")
 
     st.divider()
 
@@ -312,7 +396,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("💡 Подсказка")
-    st.write("Введите исследовательский запрос. Если нужны уточнения, ответьте на вопросы.")
+    st.write("Текущая версия возвращает результат 2 тула.")
     st.write("После завершения вы получите готовый дизайн исследования в JSON.")
 
 st.markdown("""
