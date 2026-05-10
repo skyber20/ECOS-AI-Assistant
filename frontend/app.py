@@ -85,6 +85,8 @@ def simulate_llm_response(prompt: str) -> str:
         json={"prompt": prompt}
     )
     return response.json()["response"]
+
+# это у нас был мок для проверки вывода графиков
 # def simulate_llm_response(prompt: str) -> str:
 #     """Имитация ответа LLM. Потом заменим на нормальную"""
 #     time.sleep(0.5)
@@ -295,14 +297,14 @@ with st.sidebar:
     st.divider()
     
 
-st.subheader("📊 Поддерживаемые библиотеки")
+st.subheader("Поддерживаемые для отображения результата выполнения кода библиотеки")
 st.write("• matplotlib")
 st.write("• pandas")
 st.write("• numpy")
 st.write("• Все стандартные библиотеки Python")
 
 st.divider()
-st.caption("💡 Сейчас стоит заглушка `simulate_llm_response()`, которую надо будет изменить")
+st.caption("💡 Сейчас стоит заглушка в бекенде, которую надо будет изменить")
 
 # CSS стили
 st.markdown("""

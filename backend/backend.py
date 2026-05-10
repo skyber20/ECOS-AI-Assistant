@@ -1,4 +1,3 @@
-# backend.py
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -7,6 +6,7 @@ import json
 import os
 from datetime import datetime
 
+#from API import agent ili kak tam u nas ya xz
 app = FastAPI()
 
 app.add_middleware(
@@ -28,7 +28,7 @@ class AgentResponse(BaseModel):
 
 @app.post("/api/agent/run")
 async def run_agent(request: AgentRequest):
-    # Здесь вызывай своего агента
+    # Здесь вызываем этого бобика
     # result = your_agent.run(request.prompt, request.context)
     
     # Заглушка
