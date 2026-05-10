@@ -69,12 +69,9 @@ class MainFlowTest(unittest.TestCase):
             status=OrchestrationStatus.DESIGN_READY,
             intent=refined_intent,
         )
+        agent = _FakeResearchAgent(initial_intent, refined_intent, design_result)
 
-        with (
-            patch("main.parse_research_intent", return_value=initial_intent),
-            patch("main.refine_intent_with_clarifications", return_value=refined_intent) as refine,
-            patch("main.continue_research_flow", return_value=design_result) as continue_flow,
-        ):
+        with patch("main.LangGraphResearchAgent", return_value=agent):
             result = run_interactive_research_flow(
                 "Дай данные по инфляции.",
                 input_stream=io.StringIO("Россия\n2020-2024\n"),
@@ -82,9 +79,40 @@ class MainFlowTest(unittest.TestCase):
             )
 
         self.assertEqual(result.status, OrchestrationStatus.DESIGN_READY)
-        self.assertEqual(refine.call_count, 1)
-        continue_flow.assert_called_once()
-        self.assertIs(continue_flow.call_args.args[0], refined_intent)
+        self.assertEqual(agent.refine_calls, 1)
+        self.assertEqual(agent.continue_calls, 1)
+        self.assertIs(agent.continued_intent, refined_intent)
+
+
+class _FakeResearchAgent:
+    def __init__(
+        self,
+        initial_intent: ResearchIntent,
+        refined_intent: ResearchIntent,
+        design_result: OrchestrationResult,
+    ) -> None:
+        self.initial_intent = initial_intent
+        self.refined_intent = refined_intent
+        self.design_result = design_result
+        self.refine_calls = 0
+        self.continue_calls = 0
+        self.continued_intent = None
+
+    def parse_intent(self, query: str) -> ResearchIntent:
+        return self.initial_intent
+
+    def refine_intent(
+        self,
+        intent: ResearchIntent,
+        answers: list,
+    ) -> ResearchIntent:
+        self.refine_calls += 1
+        return self.refined_intent
+
+    def continue_from_intent(self, intent: ResearchIntent) -> OrchestrationResult:
+        self.continue_calls += 1
+        self.continued_intent = intent
+        return self.design_result
 
 
 if __name__ == "__main__":

@@ -380,10 +380,6 @@ def create_llm_settings(
     )
 
 
-def create_llm_client(provider: str | None = None) -> OpenAI:
-    return create_llm_settings(provider=provider).client
-
-
 def _create_qwen_settings(model: str | None = None) -> LLMSettings:
     api_key = _get_env("QWEN_API_KEY")
     base_url = _get_env("QWEN_BASE_URL")
@@ -442,37 +438,6 @@ def _get_env(*names: str) -> str | None:
         if value and value.strip():
             return value.strip()
     return None
-
-
-def parse_research_intent(
-    query: str,
-    client: OpenAI | None = None,
-    model: str | None = None,
-    provider: str | None = None,
-) -> ResearchIntent:
-    if not query.strip():
-        raise ValueError("Query must not be empty.")
-
-    load_dotenv()
-
-    settings = (
-        LLMSettings(
-            provider=provider or "custom",
-            client=client,
-            mode=LLMMode.CHAT_COMPLETIONS,
-            model=model or _get_env("QWEN_MODEL") or "qwen3.5-122b",
-        )
-        if client
-        else create_llm_settings(provider=provider, model=model)
-    )
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": query},
-    ]
-
-    content = _create_json_completion(settings, messages)
-    return _parse_intent_json(content, original_query=query)
 
 
 def _create_json_completion(

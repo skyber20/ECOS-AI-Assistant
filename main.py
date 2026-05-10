@@ -3,19 +3,14 @@ import json
 import sys
 from typing import TextIO
 
-from openai import OpenAIError
-
-from intent_parser import IntentParserError, parse_research_intent
 from orchestrator import (
     ClarificationAnswer,
     ClarificationRequest,
+    LangGraphResearchAgent,
     OrchestrationResult,
     OrchestrationStatus,
-    continue_research_flow,
     prepare_intent_for_design,
-    refine_intent_with_clarifications,
 )
-from research_designer import ResearchDesignerError
 
 
 MAX_CLARIFICATION_ROUNDS = 3
@@ -59,10 +54,7 @@ def main() -> None:
         return
     except (
         RuntimeError,
-        IntentParserError,
-        ResearchDesignerError,
         ValueError,
-        OpenAIError,
     ) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
@@ -76,26 +68,22 @@ def run_interactive_research_flow(
     error_stream: TextIO | None = None,
     max_clarification_rounds: int = MAX_CLARIFICATION_ROUNDS,
 ) -> OrchestrationResult:
+    if not query.strip():
+        raise ValueError("Query must not be empty.")
+
     input_stream = input_stream or sys.stdin
     error_stream = error_stream or sys.stderr
+    agent = LangGraphResearchAgent(provider=provider, model=model)
 
     print("запустился 1 этап перевода в формальный запрос", file=error_stream, flush=True)
-    intent = parse_research_intent(
-        query,
-        provider=provider,
-        model=model,
-    )
+    intent = agent.parse_intent(query)
     print("завершился 1 этап перевода в формальный запрос", file=error_stream, flush=True)
 
     for round_number in range(1, max_clarification_rounds + 1):
         readiness = prepare_intent_for_design(intent)
         if readiness.status == OrchestrationStatus.READY_FOR_DESIGN:
             print("запустился 2 этап построения дизайна исследования", file=error_stream, flush=True)
-            return continue_research_flow(
-                intent,
-                provider=provider,
-                model=model,
-            )
+            return agent.continue_from_intent(intent)
 
         if readiness.status != OrchestrationStatus.NEEDS_CLARIFICATION:
             return readiness
@@ -112,21 +100,12 @@ def run_interactive_research_flow(
             error_stream=error_stream,
         )
         print("обновляю основной контракт с уточнениями пользователя", file=error_stream, flush=True)
-        intent = refine_intent_with_clarifications(
-            intent,
-            answers,
-            provider=provider,
-            model=model,
-        )
+        intent = agent.refine_intent(intent, answers)
 
     readiness = prepare_intent_for_design(intent)
     if readiness.status == OrchestrationStatus.READY_FOR_DESIGN:
         print("запустился 2 этап построения дизайна исследования", file=error_stream, flush=True)
-        return continue_research_flow(
-            intent,
-            provider=provider,
-            model=model,
-        )
+        return agent.continue_from_intent(intent)
 
     missing_fields = ", ".join(request.field for request in readiness.clarification_requests)
     raise RuntimeError(

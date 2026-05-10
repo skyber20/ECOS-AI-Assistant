@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from intent_parser import (
@@ -5,12 +6,15 @@ from intent_parser import (
     DatasetSpec,
     IndicatorSpec,
     IntentType,
+    LLMMode,
+    LLMSettings,
     NextAction,
     ResearchIntent,
     TimeRange,
 )
 from orchestrator import (
     ClarificationAnswer,
+    LangGraphResearchAgent,
     OrchestrationStatus,
     build_refine_intent_messages,
     prepare_intent_for_design,
@@ -19,6 +23,92 @@ from orchestrator import (
 
 
 class OrchestratorTest(unittest.TestCase):
+    def test_langgraph_retries_invalid_intent_json_and_reaches_design(self) -> None:
+        query = "Покажи динамику ИПЦ России за 2020-2024."
+        intent = ResearchIntent(
+            original_query=query,
+            intent_type=IntentType.SIMPLE_DATA,
+            complexity=Complexity.EASY,
+            topic="динамика ИПЦ России",
+            geography=["Россия"],
+            time_range=TimeRange(
+                raw="2020-2024",
+                start_year=2020,
+                end_year=2024,
+                is_explicit=True,
+            ),
+            frequency="годовая",
+            indicators=["ИПЦ"],
+            indicator_specs=[
+                IndicatorSpec(
+                    name="ИПЦ",
+                    definition="индекс потребительских цен, декабрь к декабрю предыдущего года",
+                    unit="%",
+                    role="primary",
+                )
+            ],
+            dataset_spec=DatasetSpec(
+                row_grain="год",
+                columns=["год", "ИПЦ", "источник"],
+                rows_approx="5",
+                frequency="годовая",
+            ),
+            confidence=0.9,
+            next_action=NextAction.PROCEED_WITH_ASSUMPTIONS,
+        )
+        design_payload = {
+            "original_query": query,
+            "design_summary": "Дизайн динамического ряда ИПЦ России.",
+            "methodology_notes": "Использовать годовую частоту.",
+            "can_continue": True,
+        }
+        client = _SequencedLLMClient(
+            [
+                "это не json",
+                intent.model_dump_json(ensure_ascii=False),
+                json.dumps(design_payload, ensure_ascii=False),
+            ]
+        )
+        settings = LLMSettings(
+            provider="test",
+            client=client,
+            mode=LLMMode.CHAT_COMPLETIONS,
+            model="test-model",
+        )
+
+        agent = LangGraphResearchAgent(
+            settings=settings,
+            max_tool_retries=1,
+        )
+
+        result = agent.run(query)
+
+        self.assertEqual(result.status, OrchestrationStatus.DESIGN_READY)
+        self.assertIsNotNone(result.research_design)
+        self.assertEqual(len(client.requests), 3)
+        self.assertIn(
+            "исправляешь ответ инструмента parse_intent",
+            client.requests[1]["messages"][0]["content"],
+        )
+        self.assertIn("ОШИБКА ИНСТРУМЕНТА", client.requests[1]["messages"][1]["content"])
+
+    def test_langgraph_stops_after_retry_limit(self) -> None:
+        client = _SequencedLLMClient(["не json", "тоже не json"])
+        settings = LLMSettings(
+            provider="test",
+            client=client,
+            mode=LLMMode.CHAT_COMPLETIONS,
+            model="test-model",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "parse_intent failed after 2 attempts"):
+            LangGraphResearchAgent(
+                settings=settings,
+                max_tool_retries=1,
+            ).parse_intent("Покажи инфляцию России.")
+
+        self.assertEqual(len(client.requests), 2)
+
     def test_ambiguous_intent_requires_clarification_before_design(self) -> None:
         intent = ResearchIntent(
             original_query="Дай данные по инфляции.",
@@ -260,6 +350,46 @@ class OrchestratorTest(unittest.TestCase):
         self.assertIn("ОТВЕТЫ ПОЛЬЗОВАТЕЛЯ", user_message)
         self.assertIn("2010-2024", user_message)
         self.assertIn('"intent_type": "comparative"', user_message)
+
+
+class _SequencedLLMClient:
+    def __init__(self, contents: list[str]) -> None:
+        self.contents = list(contents)
+        self.requests: list[dict] = []
+        self.chat = _SequencedChat(self)
+
+
+class _SequencedChat:
+    def __init__(self, owner: _SequencedLLMClient) -> None:
+        self.completions = _SequencedCompletions(owner)
+
+
+class _SequencedCompletions:
+    def __init__(self, owner: _SequencedLLMClient) -> None:
+        self.owner = owner
+
+    def create(self, **kwargs):
+        self.owner.requests.append(kwargs)
+        if not self.owner.contents:
+            raise AssertionError("No fake LLM responses left.")
+        content = self.owner.contents.pop(0)
+
+        class Message:
+            pass
+
+        class Choice:
+            pass
+
+        class Response:
+            pass
+
+        message = Message()
+        message.content = content
+        choice = Choice()
+        choice.message = message
+        response = Response()
+        response.choices = [choice]
+        return response
 
 
 if __name__ == "__main__":

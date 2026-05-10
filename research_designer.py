@@ -6,12 +6,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from intent_parser import (
     IntentParserError,
     IntentType,
-    LLMSettings,
     NextAction,
     ResearchIntent,
-    _create_json_completion,
     _load_json_object,
-    create_llm_settings,
     none_to_empty_list,
 )
 
@@ -199,19 +196,6 @@ ResearchIntent — главный контракт для дизайна исс�
 
 class ResearchDesignerError(RuntimeError):
     """Raised when a study design cannot be generated or parsed."""
-
-
-def design_research(
-    intent: ResearchIntent,
-    settings: LLMSettings | None = None,
-    provider: str | None = None,
-    model: str | None = None,
-) -> ResearchStudyDesign:
-    llm_settings = settings or create_llm_settings(provider=provider, model=model)
-    messages = build_research_design_messages(intent)
-
-    content = _create_json_completion(llm_settings, messages)
-    return _parse_design_json(content, intent)
 
 
 def build_research_design_messages(intent: ResearchIntent) -> list[dict[str, str]]:

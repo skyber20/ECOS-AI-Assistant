@@ -1,20 +1,28 @@
 from enum import Enum
-from typing import Any
+import warnings
+from typing import Any, Literal, TypedDict
 
+from langchain_core._api.deprecation import LangChainPendingDeprecationWarning
+
+warnings.simplefilter("ignore", LangChainPendingDeprecationWarning)
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from intent_parser import (
     IntentType,
-    IntentParserError,
     LLMSettings,
     NextAction,
     ResearchIntent,
+    SYSTEM_PROMPT,
     _create_json_completion,
     _parse_intent_json,
     create_llm_settings,
-    parse_research_intent,
 )
-from research_designer import ResearchStudyDesign, design_research
+from research_designer import (
+    ResearchStudyDesign,
+    _parse_design_json,
+    build_research_design_messages,
+)
 
 
 class OrchestrationStatus(str, Enum):
@@ -58,6 +66,48 @@ class OrchestrationResult(BaseModel):
         return [] if value is None else value
 
 
+DEFAULT_MAX_TOOL_RETRIES = 2
+DEFAULT_MAX_GRAPH_STEPS = 16
+
+GraphOperation = Literal[
+    "parse_intent",
+    "run",
+    "continue",
+    "refine_intent",
+]
+
+
+class ToolExecutionError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool: str
+    attempt: int
+    error: str
+    raw_output: str | None = None
+
+
+class ResearchAgentState(TypedDict, total=False):
+    operation: GraphOperation
+    query: str
+    intent: ResearchIntent
+    clarification_answers: list[ClarificationAnswer]
+    settings: LLMSettings
+    use_defaults: bool
+    readiness: OrchestrationResult
+    research_design: ResearchStudyDesign
+    result: OrchestrationResult
+    next_node: str
+    refined_done: bool
+    last_tool: str
+    last_error: str | None
+    last_raw_output: str | None
+    tool_errors: list[ToolExecutionError]
+    tool_attempts: dict[str, int]
+    graph_steps: int
+    max_tool_retries: int
+    max_graph_steps: int
+
+
 REFINE_INTENT_PROMPT = """Ты обновляешь JSON первого этапа ResearchIntent после уточнений пользователя.
 
 На входе:
@@ -75,71 +125,438 @@ REFINE_INTENT_PROMPT = """Ты обновляешь JSON первого этап
 - Не запускай дизайн исследования и не придумывай числовые значения данных.
 """
 
+INTENT_REPAIR_PROMPT = """Ты исправляешь ответ инструмента parse_intent.
 
-def run_research_flow(
-    query: str,
-    settings: LLMSettings | None = None,
-    provider: str | None = None,
-    model: str | None = None,
-    use_defaults: bool = False,
-) -> OrchestrationResult:
-    intent = parse_research_intent(
-        query,
-        provider=provider,
-        model=model,
+На входе:
+1. исходный пользовательский запрос;
+2. предыдущий ответ LLM;
+3. ошибка парсинга или валидации.
+
+Правила:
+- Верни только полный валидный JSON ResearchIntent без Markdown.
+- Исправь только формат, типы, enum-значения, лишние или пропущенные поля.
+- Не меняй смысл исходного запроса без необходимости.
+- Не добавляй поля вне схемы ResearchIntent.
+"""
+
+REFINE_REPAIR_PROMPT = """Ты исправляешь ответ инструмента refine_intent.
+
+На входе:
+1. предыдущий ResearchIntent;
+2. ответы пользователя на уточнения;
+3. предыдущий ответ LLM;
+4. ошибка парсинга или валидации.
+
+Правила:
+- Верни только полный валидный JSON ResearchIntent без Markdown.
+- Сохрани смысл уточнений пользователя.
+- Исправь только формат, типы, enum-значения, лишние или пропущенные поля.
+- Не запускай дизайн исследования и не придумывай числовые значения данных.
+"""
+
+DESIGN_REPAIR_PROMPT = """Ты исправляешь ответ инструмента design_research.
+
+На входе:
+1. исходный ResearchIntent;
+2. предыдущий ответ LLM;
+3. ошибка парсинга или валидации.
+
+Правила:
+- Верни только полный валидный JSON ResearchStudyDesign без Markdown.
+- Исправь только формат, типы, enum-значения, лишние или пропущенные поля.
+- Все содержательные решения должны оставаться трассируемыми к ResearchIntent.
+- Не придумывай числовые значения наблюдений.
+"""
+
+
+class LangGraphResearchAgent:
+    """LangGraph agent that coordinates research parsing, clarification and design."""
+
+    def __init__(
+        self,
+        settings: LLMSettings | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        max_tool_retries: int = DEFAULT_MAX_TOOL_RETRIES,
+        max_graph_steps: int = DEFAULT_MAX_GRAPH_STEPS,
+    ) -> None:
+        self.settings = settings or create_llm_settings(provider=provider, model=model)
+        self.max_tool_retries = max_tool_retries
+        self.max_graph_steps = max_graph_steps
+        self.graph = self._build_graph()
+
+    def parse_intent(self, query: str) -> ResearchIntent:
+        if not query.strip():
+            raise ValueError("Query must not be empty.")
+
+        state = self._invoke(
+            {
+                "operation": "parse_intent",
+                "query": query,
+            }
+        )
+        return state["intent"]
+
+    def run(self, query: str, use_defaults: bool = False) -> OrchestrationResult:
+        if not query.strip():
+            raise ValueError("Query must not be empty.")
+
+        state = self._invoke(
+            {
+                "operation": "run",
+                "query": query,
+                "use_defaults": use_defaults,
+            }
+        )
+        return state["result"]
+
+    def continue_from_intent(
+        self,
+        intent: ResearchIntent,
+        use_defaults: bool = False,
+    ) -> OrchestrationResult:
+        state = self._invoke(
+            {
+                "operation": "continue",
+                "intent": intent,
+                "use_defaults": use_defaults,
+            }
+        )
+        return state["result"]
+
+    def refine_intent(
+        self,
+        intent: ResearchIntent,
+        answers: list[ClarificationAnswer],
+    ) -> ResearchIntent:
+        if not answers:
+            return intent
+
+        state = self._invoke(
+            {
+                "operation": "refine_intent",
+                "intent": intent,
+                "clarification_answers": answers,
+            }
+        )
+        return state["intent"]
+
+    def _invoke(self, initial_state: ResearchAgentState) -> ResearchAgentState:
+        state: ResearchAgentState = {
+            "settings": self.settings,
+            "max_tool_retries": self.max_tool_retries,
+            "max_graph_steps": self.max_graph_steps,
+            "tool_attempts": {},
+            "tool_errors": [],
+            "graph_steps": 0,
+            **initial_state,
+        }
+        return self.graph.invoke(state)
+
+    def _build_graph(self):
+        graph = StateGraph(ResearchAgentState)
+        graph.add_node("agent", self._agent_node)
+        graph.add_node("parse_intent", self._parse_intent_tool)
+        graph.add_node("refine_intent", self._refine_intent_tool)
+        graph.add_node("validate_intent", self._validate_intent_tool)
+        graph.add_node("design_research", self._design_research_tool)
+
+        graph.add_edge(START, "agent")
+        graph.add_conditional_edges(
+            "agent",
+            self._route_from_agent,
+            {
+                "parse_intent": "parse_intent",
+                "refine_intent": "refine_intent",
+                "validate_intent": "validate_intent",
+                "design_research": "design_research",
+                END: END,
+            },
+        )
+        graph.add_edge("parse_intent", "agent")
+        graph.add_edge("refine_intent", "agent")
+        graph.add_edge("validate_intent", "agent")
+        graph.add_edge("design_research", "agent")
+        return graph.compile()
+
+    def _agent_node(self, state: ResearchAgentState) -> ResearchAgentState:
+        graph_steps = state.get("graph_steps", 0) + 1
+        max_graph_steps = state.get("max_graph_steps", DEFAULT_MAX_GRAPH_STEPS)
+        if graph_steps > max_graph_steps:
+            raise RuntimeError(
+                f"LangGraph research agent exceeded {max_graph_steps} graph steps."
+            )
+
+        if state.get("last_error"):
+            last_tool = state.get("last_tool") or "unknown"
+            attempts = state.get("tool_attempts", {}).get(last_tool, 0)
+            max_retries = state.get("max_tool_retries", DEFAULT_MAX_TOOL_RETRIES)
+            if attempts <= max_retries:
+                return {
+                    "graph_steps": graph_steps,
+                    "next_node": last_tool,
+                }
+            raise RuntimeError(
+                f"Tool {last_tool} failed after {attempts} attempts: "
+                f"{state['last_error']}"
+            )
+
+        operation = state.get("operation", "run")
+        if operation == "parse_intent":
+            next_node = END if state.get("intent") else "parse_intent"
+        elif operation == "refine_intent":
+            next_node = END if state.get("refined_done") else "refine_intent"
+        elif not state.get("intent"):
+            next_node = "parse_intent"
+        elif not state.get("readiness"):
+            next_node = "validate_intent"
+        elif state["readiness"].status != OrchestrationStatus.READY_FOR_DESIGN:
+            return {
+                "graph_steps": graph_steps,
+                "result": state["readiness"],
+                "next_node": END,
+            }
+        elif not state.get("research_design"):
+            next_node = "design_research"
+        else:
+            return {
+                "graph_steps": graph_steps,
+                "result": OrchestrationResult(
+                    status=OrchestrationStatus.DESIGN_READY,
+                    intent=state["intent"],
+                    clarification_requests=(
+                        []
+                        if state.get("use_defaults")
+                        else state["readiness"].clarification_requests
+                    ),
+                    research_design=state["research_design"],
+                ),
+                "next_node": END,
+            }
+
+        return {
+            "graph_steps": graph_steps,
+            "next_node": next_node,
+        }
+
+    def _route_from_agent(self, state: ResearchAgentState) -> str:
+        return state.get("next_node", END)
+
+    def _parse_intent_tool(self, state: ResearchAgentState) -> ResearchAgentState:
+        tool = "parse_intent"
+        query = state["query"]
+        raw_output = None
+        attempts = _increment_tool_attempts(state, tool)
+        try:
+            messages = _build_parse_intent_messages(state)
+            raw_output = _create_json_completion(state["settings"], messages)
+            intent = _parse_intent_json(raw_output, original_query=query)
+            return _tool_success(
+                state,
+                {
+                    "intent": intent,
+                    "readiness": None,
+                    "research_design": None,
+                }
+            )
+        except Exception as exc:
+            return _tool_failure(state, tool, attempts, exc, raw_output)
+
+    def _refine_intent_tool(self, state: ResearchAgentState) -> ResearchAgentState:
+        tool = "refine_intent"
+        raw_output = None
+        attempts = _increment_tool_attempts(state, tool)
+        try:
+            messages = _build_refine_messages_for_state(state)
+            raw_output = _create_json_completion(state["settings"], messages)
+            intent = _parse_intent_json(
+                raw_output,
+                original_query=state["intent"].original_query,
+            )
+            return _tool_success(
+                state,
+                {
+                    "intent": intent,
+                    "refined_done": True,
+                    "readiness": None,
+                    "research_design": None,
+                }
+            )
+        except Exception as exc:
+            return _tool_failure(state, tool, attempts, exc, raw_output)
+
+    def _validate_intent_tool(self, state: ResearchAgentState) -> ResearchAgentState:
+        readiness = prepare_intent_for_design(
+            state["intent"],
+            use_defaults=state.get("use_defaults", False),
+        )
+        return {
+            "readiness": readiness,
+            "last_tool": "",
+            "last_error": None,
+            "last_raw_output": None,
+        }
+
+    def _design_research_tool(self, state: ResearchAgentState) -> ResearchAgentState:
+        tool = "design_research"
+        raw_output = None
+        attempts = _increment_tool_attempts(state, tool)
+        try:
+            messages = _build_design_messages_for_state(state)
+            raw_output = _create_json_completion(state["settings"], messages)
+            design = _parse_design_json(raw_output, state["intent"])
+            return _tool_success(state, {"research_design": design})
+        except Exception as exc:
+            return _tool_failure(state, tool, attempts, exc, raw_output)
+
+
+def _increment_tool_attempts(state: ResearchAgentState, tool: str) -> int:
+    attempts = dict(state.get("tool_attempts", {}))
+    attempt = attempts.get(tool, 0) + 1
+    attempts[tool] = attempt
+    state["tool_attempts"] = attempts
+    return attempt
+
+
+def _tool_success(
+    state: ResearchAgentState,
+    payload: ResearchAgentState,
+) -> ResearchAgentState:
+    return {
+        **payload,
+        "last_tool": "",
+        "last_error": None,
+        "last_raw_output": None,
+        "tool_attempts": state.get("tool_attempts", {}),
+    }
+
+
+def _tool_failure(
+    state: ResearchAgentState,
+    tool: str,
+    attempt: int,
+    exc: Exception,
+    raw_output: str | None,
+) -> ResearchAgentState:
+    error = _format_tool_error(exc)
+    tool_errors = list(state.get("tool_errors", []))
+    tool_errors.append(
+        ToolExecutionError(
+            tool=tool,
+            attempt=attempt,
+            error=error,
+            raw_output=raw_output,
+        )
     )
-    return continue_research_flow(
-        intent,
-        settings=settings,
-        provider=provider,
-        model=model,
-        use_defaults=use_defaults,
+    return {
+        "last_tool": tool,
+        "last_error": error,
+        "last_raw_output": raw_output,
+        "tool_errors": tool_errors,
+        "tool_attempts": state.get("tool_attempts", {}),
+    }
+
+
+def _format_tool_error(exc: Exception) -> str:
+    return f"{exc.__class__.__name__}: {exc}"
+
+
+def _build_parse_intent_messages(state: ResearchAgentState) -> list[dict[str, str]]:
+    query = state["query"]
+    if not state.get("last_error"):
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": query},
+        ]
+
+    return [
+        {
+            "role": "system",
+            "content": f"{SYSTEM_PROMPT}\n\n{INTENT_REPAIR_PROMPT}",
+        },
+        {
+            "role": "user",
+            "content": _build_repair_user_message(
+                task_context=f"=== ИСХОДНЫЙ ЗАПРОС ===\n{query}",
+                raw_output=state.get("last_raw_output"),
+                error=state["last_error"] or "",
+                instruction="Верни исправленный полный JSON ResearchIntent.",
+            ),
+        },
+    ]
+
+
+def _build_refine_messages_for_state(
+    state: ResearchAgentState,
+) -> list[dict[str, str]]:
+    if not state.get("last_error"):
+        return build_refine_intent_messages(
+            state["intent"],
+            state.get("clarification_answers", []),
+        )
+
+    return [
+        {
+            "role": "system",
+            "content": REFINE_REPAIR_PROMPT,
+        },
+        {
+            "role": "user",
+            "content": _build_repair_user_message(
+                task_context=(
+                    "=== ПРЕДЫДУЩИЙ ResearchIntent ===\n"
+                    f"{state['intent'].model_dump_json(indent=2, ensure_ascii=False)}\n\n"
+                    "=== ОТВЕТЫ ПОЛЬЗОВАТЕЛЯ НА УТОЧНЕНИЯ ===\n"
+                    f"{_answers_to_json(state.get('clarification_answers', []))}"
+                ),
+                raw_output=state.get("last_raw_output"),
+                error=state["last_error"] or "",
+                instruction="Верни исправленный полный JSON ResearchIntent.",
+            ),
+        },
+    ]
+
+
+def _build_design_messages_for_state(
+    state: ResearchAgentState,
+) -> list[dict[str, str]]:
+    if not state.get("last_error"):
+        return build_research_design_messages(state["intent"])
+
+    return [
+        {
+            "role": "system",
+            "content": DESIGN_REPAIR_PROMPT,
+        },
+        {
+            "role": "user",
+            "content": _build_repair_user_message(
+                task_context=(
+                    "=== ResearchIntent ===\n"
+                    f"{state['intent'].model_dump_json(indent=2, ensure_ascii=False)}"
+                ),
+                raw_output=state.get("last_raw_output"),
+                error=state["last_error"] or "",
+                instruction="Верни исправленный полный JSON ResearchStudyDesign.",
+            ),
+        },
+    ]
+
+
+def _build_repair_user_message(
+    task_context: str,
+    raw_output: str | None,
+    error: str,
+    instruction: str,
+) -> str:
+    return (
+        f"{task_context}\n\n"
+        "=== ПРЕДЫДУЩИЙ ОШИБОЧНЫЙ ОТВЕТ LLM ===\n"
+        f"{raw_output or '<пустой ответ или ошибка до получения ответа>'}\n\n"
+        "=== ОШИБКА ИНСТРУМЕНТА ===\n"
+        f"{error}\n\n"
+        f"{instruction}"
     )
-
-
-def continue_research_flow(
-    intent: ResearchIntent,
-    settings: LLMSettings | None = None,
-    provider: str | None = None,
-    model: str | None = None,
-    use_defaults: bool = False,
-) -> OrchestrationResult:
-    readiness = prepare_intent_for_design(intent, use_defaults=use_defaults)
-    if readiness.status != OrchestrationStatus.READY_FOR_DESIGN:
-        return readiness
-
-    design = design_research(
-        intent,
-        settings=settings,
-        provider=provider,
-        model=model,
-    )
-    return OrchestrationResult(
-        status=OrchestrationStatus.DESIGN_READY,
-        intent=intent,
-        clarification_requests=[] if use_defaults else readiness.clarification_requests,
-        research_design=design,
-    )
-
-
-def refine_intent_with_clarifications(
-    intent: ResearchIntent,
-    answers: list[ClarificationAnswer],
-    settings: LLMSettings | None = None,
-    provider: str | None = None,
-    model: str | None = None,
-) -> ResearchIntent:
-    if not answers:
-        return intent
-
-    llm_settings = settings or create_llm_settings(provider=provider, model=model)
-    messages = build_refine_intent_messages(intent, answers)
-    content = _create_json_completion(llm_settings, messages)
-
-    try:
-        return _parse_intent_json(content, original_query=intent.original_query)
-    except IntentParserError as exc:
-        raise RuntimeError(f"Failed to refine ResearchIntent after clarification: {exc}") from exc
 
 
 def build_refine_intent_messages(
