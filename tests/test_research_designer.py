@@ -19,8 +19,11 @@ class ResearchDesignerSchemaTest(unittest.TestCase):
         )
 
         messages = build_research_design_messages(intent)
+        system_content = messages[0]["content"]
         user_content = messages[1]["content"]
 
+        self.assertIn("Ты модуль дизайна количественного исследования", system_content)
+        self.assertIn("JSON Schema", system_content)
         self.assertIn("=== ИСХОДНЫЙ ЗАПРОС ===", user_content)
         self.assertIn(intent.original_query, user_content)
         self.assertIn("=== JSON ПЕРВОГО ЭТАПА: ResearchIntent ===", user_content)
