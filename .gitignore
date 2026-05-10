@@ -1,6 +1,7 @@
-venv/
-__pycache__/
-*.pyc
 .env
+.venv/
+.idea/
+__pycache__/
+*.py[cod]
 .DS_Store
-agent_logs/
+*.pyc
