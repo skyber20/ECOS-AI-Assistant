@@ -23,6 +23,11 @@ from research_designer import (
     _parse_design_json,
     build_research_design_messages,
 )
+from target_dataset_designer import (
+    TargetDatasetStructure,
+    _parse_target_dataset_json,
+    build_target_dataset_messages,
+)
 
 
 class OrchestrationStatus(str, Enum):
@@ -58,6 +63,7 @@ class OrchestrationResult(BaseModel):
     intent: ResearchIntent
     clarification_requests: list[ClarificationRequest] = Field(default_factory=list)
     research_design: ResearchStudyDesign | None = None
+    target_dataset_structure: TargetDatasetStructure | None = None
     message: str | None = None
 
     @field_validator("clarification_requests", mode="before")
@@ -95,6 +101,7 @@ class ResearchAgentState(TypedDict, total=False):
     use_defaults: bool
     readiness: OrchestrationResult
     research_design: ResearchStudyDesign
+    target_dataset_structure: TargetDatasetStructure
     result: OrchestrationResult
     next_node: str
     refined_done: bool
@@ -165,6 +172,21 @@ DESIGN_REPAIR_PROMPT = """Ты исправляешь ответ инструм�
 - Верни только полный валидный JSON ResearchStudyDesign без Markdown.
 - Исправь только формат, типы, enum-значения, лишние или пропущенные поля.
 - Все содержательные решения должны оставаться трассируемыми к ResearchIntent.
+- Не придумывай числовые значения наблюдений.
+"""
+
+TARGET_DATASET_REPAIR_PROMPT = """Ты исправляешь ответ инструмента target_dataset_structure.
+
+На входе:
+1. исходный ResearchIntent;
+2. ResearchStudyDesign;
+3. предыдущий ответ LLM;
+4. ошибка парсинга или валидации.
+
+Правила:
+- Верни только полный валидный JSON TargetDatasetStructure без Markdown.
+- Исправь только формат, типы, enum-значения, лишние или пропущенные поля.
+- Сохрани структуру целевого датасета: row_grain, primary_key, dimensions, indicators, derived_metrics, metadata_columns и validation_rules.
 - Не придумывай числовые значения наблюдений.
 """
 
@@ -260,6 +282,7 @@ class LangGraphResearchAgent:
         graph.add_node("refine_intent", self._refine_intent_tool)
         graph.add_node("validate_intent", self._validate_intent_tool)
         graph.add_node("design_research", self._design_research_tool)
+        graph.add_node("target_dataset_structure", self._target_dataset_tool)
 
         graph.add_edge(START, "agent")
         graph.add_conditional_edges(
@@ -270,6 +293,7 @@ class LangGraphResearchAgent:
                 "refine_intent": "refine_intent",
                 "validate_intent": "validate_intent",
                 "design_research": "design_research",
+                "target_dataset_structure": "target_dataset_structure",
                 END: END,
             },
         )
@@ -277,6 +301,7 @@ class LangGraphResearchAgent:
         graph.add_edge("refine_intent", "agent")
         graph.add_edge("validate_intent", "agent")
         graph.add_edge("design_research", "agent")
+        graph.add_edge("target_dataset_structure", "agent")
         return graph.compile()
 
     def _agent_node(self, state: ResearchAgentState) -> ResearchAgentState:
@@ -318,6 +343,8 @@ class LangGraphResearchAgent:
             }
         elif not state.get("research_design"):
             next_node = "design_research"
+        elif not state.get("target_dataset_structure"):
+            next_node = "target_dataset_structure"
         else:
             return {
                 "graph_steps": graph_steps,
@@ -330,6 +357,7 @@ class LangGraphResearchAgent:
                         else state["readiness"].clarification_requests
                     ),
                     research_design=state["research_design"],
+                    target_dataset_structure=state["target_dataset_structure"],
                 ),
                 "next_node": END,
             }
@@ -406,6 +434,25 @@ class LangGraphResearchAgent:
             raw_output = _create_json_completion(state["settings"], messages)
             design = _parse_design_json(raw_output, state["intent"])
             return _tool_success(state, {"research_design": design})
+        except Exception as exc:
+            return _tool_failure(state, tool, attempts, exc, raw_output)
+
+    def _target_dataset_tool(self, state: ResearchAgentState) -> ResearchAgentState:
+        tool = "target_dataset_structure"
+        raw_output = None
+        attempts = _increment_tool_attempts(state, tool)
+        try:
+            messages = _build_target_dataset_messages_for_state(state)
+            raw_output = _create_json_completion(state["settings"], messages)
+            target_dataset_structure = _parse_target_dataset_json(
+                raw_output,
+                state["intent"],
+                state["research_design"],
+            )
+            return _tool_success(
+                state,
+                {"target_dataset_structure": target_dataset_structure},
+            )
         except Exception as exc:
             return _tool_failure(state, tool, attempts, exc, raw_output)
 
@@ -538,6 +585,37 @@ def _build_design_messages_for_state(
                 raw_output=state.get("last_raw_output"),
                 error=state["last_error"] or "",
                 instruction="Верни исправленный полный JSON ResearchStudyDesign.",
+            ),
+        },
+    ]
+
+
+def _build_target_dataset_messages_for_state(
+    state: ResearchAgentState,
+) -> list[dict[str, str]]:
+    if not state.get("last_error"):
+        return build_target_dataset_messages(
+            state["intent"],
+            state["research_design"],
+        )
+
+    return [
+        {
+            "role": "system",
+            "content": TARGET_DATASET_REPAIR_PROMPT,
+        },
+        {
+            "role": "user",
+            "content": _build_repair_user_message(
+                task_context=(
+                    "=== ResearchIntent ===\n"
+                    f"{state['intent'].model_dump_json(indent=2, ensure_ascii=False)}\n\n"
+                    "=== ResearchStudyDesign ===\n"
+                    f"{state['research_design'].model_dump_json(indent=2, ensure_ascii=False)}"
+                ),
+                raw_output=state.get("last_raw_output"),
+                error=state["last_error"] or "",
+                instruction="Верни исправленный полный JSON TargetDatasetStructure.",
             ),
         },
     ]

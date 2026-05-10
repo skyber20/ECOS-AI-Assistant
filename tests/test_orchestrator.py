@@ -62,11 +62,74 @@ class OrchestratorTest(unittest.TestCase):
             "methodology_notes": "Использовать годовую частоту.",
             "can_continue": True,
         }
+        target_dataset_payload = {
+            "original_query": query,
+            "dataset_name": "ipc_russia_2020_2024",
+            "dataset_purpose": "Годовой ряд ИПЦ России для анализа динамики.",
+            "row_grain": "год",
+            "primary_key": ["year", "country"],
+            "time_coverage": "2020-2024",
+            "geography_coverage": ["Россия"],
+            "frequency": "годовая",
+            "dimensions": [
+                {
+                    "name": "year",
+                    "title": "Год",
+                    "role": "time",
+                    "data_type": "year",
+                    "unit": None,
+                    "definition": "Год наблюдения.",
+                    "nullable": False,
+                    "is_required": True,
+                },
+                {
+                    "name": "country",
+                    "title": "Страна",
+                    "role": "geography",
+                    "data_type": "string",
+                    "unit": None,
+                    "definition": "География наблюдения.",
+                    "nullable": False,
+                    "is_required": True,
+                },
+            ],
+            "indicators": [
+                {
+                    "name": "cpi_dec_to_dec",
+                    "title": "ИПЦ декабрь к декабрю",
+                    "role": "indicator",
+                    "data_type": "float",
+                    "unit": "%",
+                    "definition": "Индекс потребительских цен, декабрь к декабрю предыдущего года.",
+                    "nullable": True,
+                    "is_required": True,
+                    "source": "Росстат",
+                }
+            ],
+            "metadata_columns": [
+                {
+                    "name": "source_name",
+                    "title": "Источник",
+                    "role": "source_metadata",
+                    "data_type": "string",
+                    "unit": None,
+                    "definition": "Название источника данных.",
+                    "nullable": False,
+                    "is_required": True,
+                }
+            ],
+            "validation_rules": [
+                "primary_key должен быть уникален",
+                "cpi_dec_to_dec должен быть числом",
+            ],
+            "can_build": True,
+        }
         client = _SequencedLLMClient(
             [
                 "это не json",
                 intent.model_dump_json(ensure_ascii=False),
                 json.dumps(design_payload, ensure_ascii=False),
+                json.dumps(target_dataset_payload, ensure_ascii=False),
             ]
         )
         settings = LLMSettings(
@@ -85,7 +148,9 @@ class OrchestratorTest(unittest.TestCase):
 
         self.assertEqual(result.status, OrchestrationStatus.DESIGN_READY)
         self.assertIsNotNone(result.research_design)
-        self.assertEqual(len(client.requests), 3)
+        self.assertIsNotNone(result.target_dataset_structure)
+        self.assertEqual(result.target_dataset_structure.row_grain, "год")
+        self.assertEqual(len(client.requests), 4)
         self.assertIn(
             "исправляешь ответ инструмента parse_intent",
             client.requests[1]["messages"][0]["content"],

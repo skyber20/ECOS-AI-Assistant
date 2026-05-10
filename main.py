@@ -177,6 +177,11 @@ def _result_to_json(result: OrchestrationResult) -> str:
             if result.research_design
             else None
         ),
+        "target_dataset_structure": (
+            result.target_dataset_structure.model_dump(mode="json")
+            if result.target_dataset_structure
+            else None
+        ),
     }
     if result.status != OrchestrationStatus.DESIGN_READY:
         payload["status"] = result.status.value
