@@ -3,8 +3,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from intent_parser import ResearchIntent, none_to_empty_list
-from research_designer import ResearchStudyDesign
+from parser.intent_parser import ResearchIntent, none_to_empty_list
+from designer.research_designer import ResearchStudyDesign
 
 
 CYRILLIC_TRANSLITERATION = str.maketrans(

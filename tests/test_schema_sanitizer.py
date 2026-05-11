@@ -2,8 +2,8 @@ import json
 import unittest
 
 from dataset_reranker import _parse_rerank_json
-from intent_parser import _parse_intent_json
-from research_designer import _parse_design_json
+from parser.intent_parser import _parse_intent_json
+from designer.research_designer import _parse_design_json
 from tests.test_dataset_pipeline import sample_design, sample_intent
 
 

@@ -2,7 +2,7 @@ import io
 import unittest
 from unittest.mock import patch
 
-from intent_parser import (
+from parser.intent_parser import (
     Complexity,
     DatasetSpec,
     IndicatorSpec,

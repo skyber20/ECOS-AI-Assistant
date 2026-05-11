@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from assembly_planner import DatasetBuildPlan
 from dataset_structure import TargetDatasetStructure
-from intent_parser import none_to_empty_list
+from parser.intent_parser import none_to_empty_list
 
 
 class GeneratedBuildScript(BaseModel):

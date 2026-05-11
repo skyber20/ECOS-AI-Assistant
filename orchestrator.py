@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from assembly_planner import DatasetBuildPlan, plan_dataset_build
 from dataset_structure import TargetDatasetStructure, build_target_dataset_structure
-from intent_parser import (
+from parser.intent_parser import (
     IntentType,
     IntentParserError,
     LLMSettings,
@@ -16,7 +16,7 @@ from intent_parser import (
     create_llm_settings,
     parse_research_intent,
 )
-from research_designer import ResearchStudyDesign, design_research
+from designer.research_designer import ResearchStudyDesign, design_research
 from script_generator import GeneratedBuildScript, generate_build_script
 
 

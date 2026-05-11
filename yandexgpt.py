@@ -1,6 +1,4 @@
-from dotenv import load_dotenv
-
-from intent_parser import SYSTEM_PROMPT, _create_json_completion, create_llm_settings
+from parser.intent_parser import SYSTEM_PROMPT, _create_json_completion, create_llm_settings
 
 settings = create_llm_settings(provider="yandex")
 content = _create_json_completion(

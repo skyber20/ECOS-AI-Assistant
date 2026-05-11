@@ -1,13 +1,12 @@
 import csv
-import json
 from pathlib import Path
 from typing import Any
 
 from assembly_planner import DatasetBuildPlan, SourceDatasetReference
 from dataset_structure import DatasetColumn, TargetDatasetStructure
-from intent_parser import Complexity, IntentType, ResearchIntent
+from parser.intent_parser import Complexity, IntentType, ResearchIntent
 from orchestrator import ClarificationRequest, OrchestrationResult, OrchestrationStatus
-from research_designer import ResearchStudyDesign
+from designer.research_designer import ResearchStudyDesign
 
 
 COMPLEXITY_LABELS = {

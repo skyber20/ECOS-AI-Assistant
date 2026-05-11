@@ -11,7 +11,7 @@ from assembly_planner import plan_dataset_build
 from catalog_bm25_indexer import tokenize_query
 from dataset_structure import build_target_dataset_structure
 from hybrid_candidate_retriever import retrieve_candidate_datasets
-from intent_parser import (
+from parser.intent_parser import (
     Complexity,
     DatasetSpec,
     IndicatorSpec,
@@ -21,7 +21,7 @@ from intent_parser import (
     SourceCandidate,
     TimeRange,
 )
-from research_designer import ResearchStudyDesign
+from designer.research_designer import ResearchStudyDesign
 from orchestrator import OrchestrationResult, OrchestrationStatus
 from script_generator import generate_build_script
 

@@ -12,7 +12,7 @@ from artifact_writer import (
     write_orchestration_artifacts,
     write_research_report_artifact,
 )
-from intent_parser import IntentParserError, parse_research_intent
+from parser.intent_parser import IntentParserError, parse_research_intent
 from orchestrator import (
     ClarificationAnswer,
     ClarificationRequest,
@@ -23,7 +23,7 @@ from orchestrator import (
     refine_intent_with_clarifications,
 )
 from research_report import generate_research_report
-from research_designer import ResearchDesignerError
+from designer.research_designer import ResearchDesignerError
 
 
 MAX_CLARIFICATION_ROUNDS = 3

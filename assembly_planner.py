@@ -6,8 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from catalog_builder import CATALOG_BM25_INDEX_PATH, CATALOG_RECORDS_PATH, CHROMA_DIR, ROOT
 from dataset_structure import TargetDatasetStructure
-from intent_parser import LLMSettings, ResearchIntent, none_to_empty_list
-from research_designer import ResearchStudyDesign
+from parser.intent_parser import LLMSettings, ResearchIntent, none_to_empty_list
+from designer.research_designer import ResearchStudyDesign
 
 
 BM25_INDEX_PATH = CATALOG_BM25_INDEX_PATH

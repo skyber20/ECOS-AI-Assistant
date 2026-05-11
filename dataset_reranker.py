@@ -4,8 +4,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from catalog_builder import CATALOG_RECORDS_PATH, ROOT
-from intent_parser import (
+from catalog_builder import CATALOG_RECORDS_PATH
+from parser.intent_parser import (
     IntentParserError,
     LLMSettings,
     _create_json_completion,
