@@ -140,16 +140,19 @@ RERANKER_PROMPT = """Ты LLM reranker для поиска датасетов п
 - Не включай похожие, фоновые, сравнительные или противоположные показатели, если пользователь прямо не просил их сравнивать.
 - Если есть 1-2 сильных кандидата, не добавляй слабые кандидаты для количества.
 - Если среди candidates есть прямые совпадения, не добавляй частичные input-датасеты для ручного расчета.
+- Не предлагай ручные пересчеты и формулы, если user_query прямо не просит derived/calculation.
+- Не пиши, что показатель можно пересчитать, умножить, разделить, масштабировать или восстановить из другого показателя, если такой расчет не указан в metadata.
 - Перед выбором каждого candidate проверь по metadata:
   1. это тот же показатель, а не похожий показатель;
   2. это нужный тип значения: absolute level, per capita, rate, percent, index, current prices, constant prices;
   3. unit не противоречит запросу;
   4. frequency не противоречит запросу;
   5. dimensions подходят под объект, географию и временную структуру запроса.
-- Если user_query просит общий показатель, не выбирай per capita, percent, rate или index как основной результат, если в metadata нет явного совпадения с общим показателем.
-- Если user_query просит per capita, percent, rate или index, не выбирай абсолютный level как основной результат, если он не является прямым input для расчета.
+- Если user_query просит общий показатель, per capita, percent, rate и index должны быть rejected_similar_candidates, а не results.
+- Если user_query просит per capita, percent, rate или index, абсолютный level должен быть rejected_similar_candidates, а не results.
 - Если user_query просит current prices или constant prices, проверяй это по title, description, methodology, tags, unit и dimensions.
-- Если candidate только помогает рассчитать нужный показатель, но сам им не является, выбирай его только когда прямого candidate нет, и явно пиши это в possible_limitations.
+- Если candidate только помогает рассчитать нужный показатель, но сам им не является, не выбирай его, если user_query не просит расчетный показатель.
+- Если прямого candidate нет, верни пустой results и объясни в no_results_reason, какие близкие candidates были отклонены.
 - Используй только переданную metadata. Не придумывай поля, coverage, значения, колонки, периоды или географию.
 - Не читай и не предполагай raw rows, parquet, clean_jsonl или observation dumps.
 - Metadata-поля record_id, dataset_id, title, source, description, tags, unit, frequency, data_path, source_url сохраняй как в кандидате.
@@ -232,6 +235,8 @@ def build_explorer_handoff(
     handoff: list[dict[str, str | None]] = []
 
     for result in results:
+        if not result.data_path:
+            continue
         item = ExplorerDatasetHandoff(
             record_id=result.record_id,
             dataset_id=result.dataset_id,
@@ -301,7 +306,7 @@ def _parse_rerank_json(content: str) -> DatasetRerankResponse:
         raise DatasetRerankerError(f"LLM returned invalid rerank JSON: {exc}") from exc
 
     try:
-        return DatasetRerankResponse.model_validate(data)
+        return DatasetRerankResponse.model_validate(data, extra="ignore")
     except ValidationError as exc:
         raise DatasetRerankerError(f"LLM JSON does not match DatasetRerankResponse schema: {exc}") from exc
 
@@ -319,11 +324,15 @@ def _hydrate_response(
         if result.record_id in seen:
             continue
         record = records_by_id.get(result.record_id)
-        if not record:
+        if not record or record.get("is_invalid"):
             continue
         payload = result.model_dump(mode="json")
         for field in OUTPUT_METADATA_FIELDS:
             payload[field] = _output_metadata_value(record.get(field), field)
+        payload["possible_limitations"] = _merge_limitations(
+            payload.get("possible_limitations"),
+            _metadata_limitations(record),
+        )
         results.append(DatasetRerankResult.model_validate(payload))
         seen.add(result.record_id)
         if len(results) >= top_n:
@@ -350,14 +359,15 @@ def _hydrate_rejected_candidates(
     result: list[RejectedSimilarCandidate] = []
     seen: set[str] = set()
 
-    for item in rejected:
+    for item in rejected[:10]:
         if item.record_id in seen:
             continue
         record = records_by_id.get(item.record_id)
+        if not record:
+            continue
         payload = item.model_dump(mode="json")
-        if record:
-            payload["dataset_id"] = _empty_to_none(record.get("dataset_id"))
-            payload["title"] = _empty_to_none(record.get("title"))
+        payload["dataset_id"] = _empty_to_none(record.get("dataset_id"))
+        payload["title"] = _empty_to_none(record.get("title"))
         result.append(RejectedSimilarCandidate.model_validate(payload))
         seen.add(item.record_id)
 
@@ -406,6 +416,27 @@ def _clean_optional_text(value: Any) -> str | None:
 
 def _empty_to_none(value: Any) -> Any:
     return None if value == "" else value
+
+
+def _merge_limitations(current: Any, additions: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    values = current if isinstance(current, list) else []
+    for value in [*values, *additions]:
+        text = _clean_optional_text(value)
+        if text and text not in seen:
+            result.append(text)
+            seen.add(text)
+    return result
+
+
+def _metadata_limitations(record: dict[str, Any]) -> list[str]:
+    limitations: list[str] = []
+    if not _clean_optional_text(record.get("data_path")):
+        limitations.append("В metadata нет локального data_path.")
+    if not _clean_optional_text(record.get("source_url")):
+        limitations.append("В metadata нет source_url.")
+    return limitations
 
 
 @lru_cache(maxsize=1)

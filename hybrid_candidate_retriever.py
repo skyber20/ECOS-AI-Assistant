@@ -5,10 +5,7 @@ from typing import Any, Iterable
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
-import chromadb
-from sentence_transformers import SentenceTransformer
-
-from catalog_bm25_indexer import search_bm25
+from catalog_bm25_indexer import DEFAULT_INDEX_PATH, search_bm25
 from catalog_builder import ROOT
 from catalog_chroma_indexer import (
     CHROMA_DIR,
@@ -51,6 +48,8 @@ def retrieve_candidate_datasets(
     candidate_top_k: int = CANDIDATE_TOP_K,
 ) -> list[dict[str, Any]]:
     vector_queries, bm25_queries = _retrieval_queries(user_query)
+    if not CATALOG_RECORDS_PATH.exists():
+        return []
     vector_results = _search_vector_many(vector_queries, vector_top_k)
     bm25_results = _search_bm25_many(bm25_queries, bm25_top_k)
     return _merge_candidates(vector_results, bm25_results)[:candidate_top_k]
@@ -90,21 +89,26 @@ def _search_vector_many(queries: list[str], top_k: int) -> list[dict[str, Any]]:
 
 
 def _search_vector(query: str, top_k: int) -> list[dict[str, Any]]:
-    if top_k <= 0:
+    if top_k <= 0 or not CHROMA_DIR.exists():
         return []
 
-    embedding = _embedding_model().encode(
-        [f"{QUERY_INSTRUCTION}{query}"],
-        normalize_embeddings=True,
-    )[0].tolist()
-    collection = chromadb.PersistentClient(path=str(CHROMA_DIR)).get_collection(
-        COLLECTION_NAME,
-    )
-    result = collection.query(
-        query_embeddings=[embedding],
-        n_results=top_k,
-        include=["metadatas", "distances"],
-    )
+    try:
+        import chromadb
+
+        embedding = _embedding_model().encode(
+            [f"{QUERY_INSTRUCTION}{query}"],
+            normalize_embeddings=True,
+        )[0].tolist()
+        collection = chromadb.PersistentClient(path=str(CHROMA_DIR)).get_collection(
+            COLLECTION_NAME,
+        )
+        result = collection.query(
+            query_embeddings=[embedding],
+            n_results=top_k,
+            include=["metadatas", "distances"],
+        )
+    except Exception:
+        return []
     metadatas = result.get("metadatas", [[]])[0]
     distances = result.get("distances", [[]])[0]
     return [
@@ -117,6 +121,9 @@ def _search_vector(query: str, top_k: int) -> list[dict[str, Any]]:
 
 
 def _search_bm25_many(queries: list[str], top_k: int) -> list[dict[str, Any]]:
+    if top_k <= 0 or not DEFAULT_INDEX_PATH.exists():
+        return []
+
     results: list[dict[str, Any]] = []
     for query in queries:
         results.extend(search_bm25(query, top_k=top_k))
@@ -202,7 +209,9 @@ def _catalog_records() -> dict[str, dict[str, Any]]:
 
 
 @lru_cache(maxsize=1)
-def _embedding_model() -> SentenceTransformer:
+def _embedding_model() -> Any:
+    from sentence_transformers import SentenceTransformer
+
     return SentenceTransformer(
         EMBEDDING_MODEL,
         cache_folder=str(EMBEDDING_CACHE_DIR),
