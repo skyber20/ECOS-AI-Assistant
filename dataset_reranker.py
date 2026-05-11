@@ -1,4 +1,5 @@
 import json
+from enum import Enum
 from functools import lru_cache
 from typing import Any
 
@@ -8,6 +9,7 @@ from catalog_builder import ROOT
 from intent_parser import (
     IntentParserError,
     LLMSettings,
+    ResearchIntent,
     _create_json_completion,
     _load_json_object,
     create_llm_settings,
@@ -57,6 +59,12 @@ class DatasetRerankerError(RuntimeError):
     pass
 
 
+class RerankLevel(str, Enum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
 class DatasetRerankResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -70,8 +78,8 @@ class DatasetRerankResult(BaseModel):
     frequency: str | None = None
     data_path: str | None = None
     source_url: str | None = None
-    relevance: float = Field(ge=0.0, le=1.0)
-    usefulness_confidence: float = Field(ge=0.0, le=1.0)
+    relevance: RerankLevel
+    usefulness_confidence: RerankLevel
     why_matched: str
     possible_limitations: list[str] = Field(default_factory=list)
 
@@ -80,11 +88,28 @@ class DatasetRerankResult(BaseModel):
     def _none_to_empty_list(cls, value: Any) -> Any:
         return none_to_empty_list(value)
 
+    @field_validator("relevance", "usefulness_confidence", mode="before")
+    @classmethod
+    def _normalize_level(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
+class RejectedSimilarCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    record_id: str
+    dataset_id: str | None = None
+    title: str | None = None
+    reason: str
+
 
 class DatasetRerankResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     results: list[DatasetRerankResult] = Field(default_factory=list, max_length=MAX_TOP_RESULTS)
+    rejected_similar_candidates: list[RejectedSimilarCandidate] = Field(default_factory=list)
     no_results_reason: str | None = None
 
 
@@ -115,20 +140,32 @@ RERANKER_PROMPT = """Ты LLM reranker для поиска датасетов п
 - Не включай похожие, фоновые, сравнительные или противоположные показатели, если пользователь прямо не просил их сравнивать.
 - Если есть 1-2 сильных кандидата, не добавляй слабые кандидаты для количества.
 - Если среди candidates есть прямые совпадения, не добавляй частичные input-датасеты для ручного расчета.
+- Перед выбором каждого candidate проверь по metadata:
+  1. это тот же показатель, а не похожий показатель;
+  2. это нужный тип значения: absolute level, per capita, rate, percent, index, current prices, constant prices;
+  3. unit не противоречит запросу;
+  4. frequency не противоречит запросу;
+  5. dimensions подходят под объект, географию и временную структуру запроса.
+- Если user_query просит общий показатель, не выбирай per capita, percent, rate или index как основной результат, если в metadata нет явного совпадения с общим показателем.
+- Если user_query просит per capita, percent, rate или index, не выбирай абсолютный level как основной результат, если он не является прямым input для расчета.
+- Если user_query просит current prices или constant prices, проверяй это по title, description, methodology, tags, unit и dimensions.
+- Если candidate только помогает рассчитать нужный показатель, но сам им не является, выбирай его только когда прямого candidate нет, и явно пиши это в possible_limitations.
 - Используй только переданную metadata. Не придумывай поля, coverage, значения, колонки, периоды или географию.
 - Не читай и не предполагай raw rows, parquet, clean_jsonl или observation dumps.
 - Metadata-поля record_id, dataset_id, title, source, description, tags, unit, frequency, data_path, source_url сохраняй как в кандидате.
 - Если metadata не хватает, пиши это в possible_limitations, но не используй ограничения как оправдание для нерелевантного выбора.
 - why_matched должен кратко объяснять, какие metadata-поля совпали с запросом и почему датасет помогает ответить пользователю.
 - possible_limitations пиши по-русски, кратко и предметно.
-- relevance: число 0..1, насколько metadata напрямую соответствует запросу.
-- usefulness_confidence: число 0..1, твоя уверенность, что этот датасет по metadata релевантен и полезен для ответа на user_query.
+- rejected_similar_candidates заполняй только для близких, но отклоненных candidates: например GDP per capita вместо GDP, rate вместо level, rural/urban вместо total, index вместо absolute value.
+- В rejected_similar_candidates.reason кратко укажи конкретное metadata-расхождение.
+- relevance: "high", "medium" или "low", насколько metadata напрямую соответствует запросу.
+- usefulness_confidence: "high", "medium" или "low", насколько уверенно по metadata можно использовать датасет для user_query.
 - Верни только валидный JSON без Markdown и лишних ключей.
 """
 
 
 def retrieve_and_rerank_datasets(
-    user_query: str,
+    user_query: str | ResearchIntent,
     settings: LLMSettings | None = None,
     provider: str | None = None,
     model: str | None = None,
@@ -141,8 +178,13 @@ def retrieve_and_rerank_datasets(
         user_query,
         candidate_top_k=candidate_limit,
     )
+    query = (
+        user_query.original_query
+        if isinstance(user_query, ResearchIntent)
+        else user_query
+    )
     return rerank_dataset_candidates(
-        user_query=user_query,
+        user_query=query,
         candidates=candidates,
         settings=settings,
         provider=provider,
@@ -270,6 +312,7 @@ def _hydrate_response(
     top_n: int,
 ) -> DatasetRerankResponse:
     results: list[DatasetRerankResult] = []
+    rejected = _hydrate_rejected_candidates(response.rejected_similar_candidates, records_by_id)
     seen: set[str] = set()
 
     for result in response.results:
@@ -289,10 +332,36 @@ def _hydrate_response(
     if not results:
         return DatasetRerankResponse(
             results=[],
+            rejected_similar_candidates=rejected,
             no_results_reason=response.no_results_reason
             or "Среди переданных retrieval-candidates не найдено релевантных датасетов.",
         )
-    return DatasetRerankResponse(results=results, no_results_reason=None)
+    return DatasetRerankResponse(
+        results=results,
+        rejected_similar_candidates=rejected,
+        no_results_reason=None,
+    )
+
+
+def _hydrate_rejected_candidates(
+    rejected: list[RejectedSimilarCandidate],
+    records_by_id: dict[str, dict[str, Any]],
+) -> list[RejectedSimilarCandidate]:
+    result: list[RejectedSimilarCandidate] = []
+    seen: set[str] = set()
+
+    for item in rejected:
+        if item.record_id in seen:
+            continue
+        record = records_by_id.get(item.record_id)
+        payload = item.model_dump(mode="json")
+        if record:
+            payload["dataset_id"] = _empty_to_none(record.get("dataset_id"))
+            payload["title"] = _empty_to_none(record.get("title"))
+        result.append(RejectedSimilarCandidate.model_validate(payload))
+        seen.add(item.record_id)
+
+    return result
 
 
 def _record_context(record: dict[str, Any]) -> dict[str, Any]:

@@ -67,7 +67,8 @@ REFINE_INTENT_PROMPT = """Ты обновляешь JSON первого этап
 Правила:
 - Верни только полный валидный JSON ResearchIntent без Markdown.
 - Не меняй смысл запроса без необходимости.
-- Обнови поля, к которым относятся ответы: topic, objects, geography, time_range, frequency, indicators, indicator_specs, entities, granularity, dataset_spec, research_questions, derived_metrics.
+- Обнови поля, к которым относятся ответы: english_query, keyword_synonyms, topic, objects, geography, time_range, frequency, indicators, indicator_specs, entities, granularity, dataset_spec, research_questions, derived_metrics.
+- Пересобери english_query и keyword_synonyms, если уточнения пользователя изменили смысл запроса.
 - Удали закрытые ambiguities и clarifying_questions.
 - Если все блокирующие уточнения закрыты, next_action = "proceed_with_assumptions".
 - Если что-то все еще неясно, оставь next_action = "ask_clarification" и добавь новые clarifying_questions.
