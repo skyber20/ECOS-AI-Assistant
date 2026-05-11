@@ -19,7 +19,7 @@ from research_designer import ResearchDesignerError
 from script_generator import ScriptGeneratorError
 
 
-USER_PROMPT = "Статистика по инфляции между Россией и США за 2010-2018 годы"
+USER_PROMPT = "Исследуй ВВП США за 2022 год"
 LLM_PROVIDER: str | None = None
 LLM_MODEL: str | None = None
 USE_DEFAULTS = False
