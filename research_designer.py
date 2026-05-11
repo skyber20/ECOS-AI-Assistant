@@ -1,7 +1,7 @@
 import json
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from intent_parser import (
     IntentParserError,
@@ -143,7 +143,10 @@ class ResearchStudyDesign(BaseModel):
     methodology_notes: str
     required_row_grain: list[str] = Field(default_factory=list)
     can_continue: bool = True
-    blocking_reasons: list[str] = Field(default_factory=list)
+    blocking_reasons: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("blocking_reasons", "blocking_reasones"),
+    )
 
     @field_validator(
         "hypotheses",
@@ -168,7 +171,7 @@ RESEARCH_DESIGN_PROMPT = """Ты модуль дизайна количеств�
 1. исходный пользовательский запрос;
 2. JSON первого этапа ResearchIntent.
 
-ResearchIntent — главный контракт для дизайна исследования. Исходный запрос используй только как дополнительный контекст для формулировок и нюансов, но не извлекай из него заново географию, период, показатели или тип задачи в обход JSON.
+ResearchIntent - главный контракт для дизайна исследования. Исходный запрос используй только как дополнительный контекст для формулировок и нюансов, но не извлекай из него заново географию, период, показатели или тип задачи в обход JSON.
 
 Твоя задача: построить исследовательский дизайн:
 - проверяемые гипотезы;
@@ -182,7 +185,7 @@ ResearchIntent — главный контракт для дизайна исс�
 Правила:
 - Верни только валидный JSON без Markdown.
 - Не придумывай числовые значения наблюдений.
-- Не утверждай, что данные уже собраны. Источники — только кандидаты.
+- Не утверждай, что данные уже собраны. Источники - только кандидаты.
 - Все гипотезы, измерения, группировки, формулы и визуализации должны быть трассируемы к полям ResearchIntent: indicators, indicator_specs, research_questions, research_design, derived_metrics, dataset_spec, geography, time_range, frequency, assumptions_if_no_answer.
 - Если исходный запрос и ResearchIntent конфликтуют, следуй ResearchIntent и укажи ограничение в methodology_notes.
 - Если intent_type=no_data, выставь can_continue=false и объясни blocking_reasons.

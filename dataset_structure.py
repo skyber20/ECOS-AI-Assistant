@@ -7,6 +7,45 @@ from intent_parser import ResearchIntent, none_to_empty_list
 from research_designer import ResearchStudyDesign
 
 
+CYRILLIC_TRANSLITERATION = str.maketrans(
+    {
+        "а": "a",
+        "б": "b",
+        "в": "v",
+        "г": "g",
+        "д": "d",
+        "е": "e",
+        "ё": "e",
+        "ж": "zh",
+        "з": "z",
+        "и": "i",
+        "й": "y",
+        "к": "k",
+        "л": "l",
+        "м": "m",
+        "н": "n",
+        "о": "o",
+        "п": "p",
+        "р": "r",
+        "с": "s",
+        "т": "t",
+        "у": "u",
+        "ф": "f",
+        "х": "h",
+        "ц": "ts",
+        "ч": "ch",
+        "ш": "sh",
+        "щ": "sch",
+        "ъ": "",
+        "ы": "y",
+        "ь": "",
+        "э": "e",
+        "ю": "yu",
+        "я": "ya",
+    }
+)
+
+
 class DatasetColumn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -43,25 +82,47 @@ def build_target_dataset_structure(
 ) -> TargetDatasetStructure:
     row_grain = _row_grain(intent, design)
     columns: list[DatasetColumn] = []
+    primary_key: list[str] = []
 
     for column in _dimension_columns(intent, row_grain):
         _append_column(columns, column)
-    for column in _measurement_columns(intent, design):
-        _append_column(columns, column)
-    for column in _derived_columns(intent, design):
-        _append_column(columns, column)
+        if not column.nullable:
+            primary_key.append(column.name)
+
+    for index, column in enumerate(_measurement_columns(intent, design), start=1):
+        _append_column(columns, _with_fallback_name(column, f"indicator_{index}"))
+
+    for index, column in enumerate(_derived_columns(intent, design), start=1):
+        _append_column(columns, _with_fallback_name(column, f"derived_{index}"))
+
     for column in _metadata_columns():
         _append_column(columns, column)
 
+    if not primary_key:
+        primary_key = [column.name for column in columns if column.role == "dimension"]
+
     return TargetDatasetStructure(
         row_grain=row_grain,
-        primary_key=[column.name for column in columns if column.role == "dimension" and not column.nullable],
+        primary_key=primary_key,
         columns=columns,
         expected_frequency=intent.frequency or (intent.dataset_spec.frequency if intent.dataset_spec else None),
         time_range=_time_range(intent),
         geography=list(dict.fromkeys([*intent.geography, *intent.objects, *intent.entities])),
-        design_notes=_design_notes(intent, design),
+        design_notes=_design_notes(intent, design, row_grain),
     )
+
+
+def slugify(value: str | None, fallback: str) -> str:
+    if not value:
+        return fallback
+    text = value.strip().lower().translate(CYRILLIC_TRANSLITERATION)
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    if not text or not re.search(r"[a-z]", text):
+        return fallback
+    if text[0].isdigit():
+        text = f"v_{text}"
+    return text[:64]
 
 
 def _row_grain(intent: ResearchIntent, design: ResearchStudyDesign) -> str:
@@ -141,19 +202,25 @@ def _measurement_columns(
     design: ResearchStudyDesign,
 ) -> list[DatasetColumn]:
     specs = {spec.name.lower(): spec for spec in intent.indicator_specs}
-    names = _unique([
+    measurement_names = [
+        measurement.name
+        for measurement in design.required_measurements
+        if _is_measurement_indicator(measurement)
+    ]
+    names = _unique(measurement_names or [
         *intent.indicators,
         *[spec.name for spec in intent.indicator_specs],
-        *[measurement.name for measurement in design.required_measurements],
     ])
     columns: list[DatasetColumn] = []
 
     for index, name in enumerate(names, start=1):
+        if _is_dimension_or_metadata_name(name):
+            continue
         spec = specs.get(name.lower())
         measurement = _measurement(design, name)
         columns.append(
             DatasetColumn(
-                name=f"indicator_{index}",
+                name=slugify(name, f"indicator_{index}"),
                 title=name,
                 role="indicator",
                 dtype="number",
@@ -175,10 +242,12 @@ def _derived_columns(
     seen: set[str] = set()
 
     for metric in design.derived_metrics:
+        if _is_dimension_or_metadata_name(metric.name):
+            continue
         seen.add(metric.name.lower())
         columns.append(
             DatasetColumn(
-                name=f"derived_{len(columns) + 1}",
+                name=slugify(metric.name, f"derived_{len(columns) + 1}"),
                 title=metric.name,
                 role="derived_metric",
                 dtype="number",
@@ -190,11 +259,11 @@ def _derived_columns(
         )
 
     for metric in intent.derived_metrics:
-        if metric.name.lower() in seen:
+        if metric.name.lower() in seen or _is_dimension_or_metadata_name(metric.name):
             continue
         columns.append(
             DatasetColumn(
-                name=f"derived_{len(columns) + 1}",
+                name=slugify(metric.name, f"derived_{len(columns) + 1}"),
                 title=metric.name,
                 role="derived_metric",
                 dtype="number",
@@ -212,18 +281,19 @@ def _metadata_columns() -> list[DatasetColumn]:
         DatasetColumn(name="source_name", title="Источник", role="metadata", dtype="string"),
         DatasetColumn(name="source_url", title="Ссылка на источник", role="metadata", dtype="string"),
         DatasetColumn(name="source_dataset_id", title="Идентификатор исходного датасета", role="metadata", dtype="string"),
+        DatasetColumn(name="downloaded_at", title="Дата сборки", role="metadata", dtype="datetime"),
     ]
 
 
-def _design_notes(intent: ResearchIntent, design: ResearchStudyDesign) -> list[str]:
-    notes: list[str] = []
+def _design_notes(intent: ResearchIntent, design: ResearchStudyDesign, row_grain: str) -> list[str]:
+    notes: list[str] = [f"Зернистость строк: {row_grain}."]
     if intent.dataset_spec and intent.dataset_spec.columns:
         notes.append("Ожидаемые колонки из запроса: " + ", ".join(intent.dataset_spec.columns))
     if design.methodology_notes:
         notes.append(design.methodology_notes)
     if intent.assumptions_if_no_answer:
         notes.append("Допущения: " + "; ".join(intent.assumptions_if_no_answer))
-    notes.append("Физическая схема исходных файлов не заявляется, пока explorer не прочитал data_path.")
+    notes.append("Физическая схема исходных файлов определяется только исполняемым скриптом по data_path.")
     return notes
 
 
@@ -239,6 +309,14 @@ def _append_column(columns: list[DatasetColumn], column: DatasetColumn) -> None:
     payload = column.model_dump()
     payload["name"] = f"{base}_{index}"
     columns.append(DatasetColumn.model_validate(payload))
+
+
+def _with_fallback_name(column: DatasetColumn, fallback: str) -> DatasetColumn:
+    if column.name:
+        return column
+    payload = column.model_dump()
+    payload["name"] = fallback
+    return DatasetColumn.model_validate(payload)
 
 
 def _measurement(design: ResearchStudyDesign, name: str):
@@ -261,6 +339,34 @@ def _time_range(intent: ResearchIntent) -> str | None:
     if intent.time_range.end_year:
         return f"по {intent.time_range.end_year}"
     return None
+
+
+def _is_measurement_indicator(measurement: Any) -> bool:
+    role = str(getattr(measurement, "role", "") or "").strip().lower()
+    return role not in {"grouping", "dimension", "metadata", "id", "identifier"}
+
+
+def _is_dimension_or_metadata_name(value: str) -> bool:
+    key = slugify(value, "").lower()
+    blocked = {
+        "year",
+        "god",
+        "date",
+        "period",
+        "country",
+        "country_code",
+        "country_id",
+        "countryiso3code",
+        "geo",
+        "geography",
+        "source",
+        "source_name",
+        "source_url",
+        "source_dataset_id",
+        "data_retrieval_date",
+        "downloaded_at",
+    }
+    return key in blocked
 
 
 def _contains(text: str, *tokens: str) -> bool:

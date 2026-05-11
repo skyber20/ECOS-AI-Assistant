@@ -14,6 +14,7 @@ from dataset_reranker import (
     build_explorer_handoff,
     retrieve_and_rerank_datasets,
 )
+from dataset_structure import TargetDatasetStructure, build_target_dataset_structure
 from intent_parser import (
     IntentType,
     LLMSettings,
@@ -25,6 +26,12 @@ from intent_parser import (
     create_llm_settings,
 )
 from research_designer import ResearchStudyDesign, design_research
+from script_generator import (
+    BuildScriptRun,
+    GeneratedBuildScript,
+    generate_and_run_build_script,
+    generate_build_script,
+)
 
 
 class OrchestrationStatus(str, Enum):
@@ -62,6 +69,9 @@ class OrchestrationResult(BaseModel):
     dataset_rerank: DatasetRerankResponse | None = None
     explorer_datasets: list[ExplorerDatasetHandoff] = Field(default_factory=list)
     research_design: ResearchStudyDesign | None = None
+    dataset_structure: TargetDatasetStructure | None = None
+    build_script: GeneratedBuildScript | None = None
+    build_run: BuildScriptRun | None = None
     message: str | None = None
 
     @field_validator("clarification_requests", "explorer_datasets", mode="before")
@@ -84,6 +94,9 @@ class ResearchAgentState(TypedDict, total=False):
     dataset_rerank: DatasetRerankResponse
     explorer_datasets: list[dict[str, str | None]]
     research_design: ResearchStudyDesign
+    dataset_structure: TargetDatasetStructure
+    build_script: GeneratedBuildScript
+    build_run: BuildScriptRun
     result: OrchestrationResult
 
 
@@ -112,8 +125,14 @@ class LangGraphResearchAgent:
         settings: LLMSettings | None = None,
         provider: str | None = None,
         model: str | None = None,
+        run_build_script: bool = True,
+        build_output_dir: str = "artifacts/latest_run/generated_dataset",
+        max_build_tries: int = 3,
     ) -> None:
         self.settings = settings or create_llm_settings(provider=provider, model=model)
+        self.run_build_script = run_build_script
+        self.build_output_dir = build_output_dir
+        self.max_build_tries = max_build_tries
         self.graph = self._build_graph()
 
     def parse_intent(self, query: str) -> ResearchIntent:
@@ -306,8 +325,31 @@ class LangGraphResearchAgent:
 
     def _design_research_node(self, state: ResearchAgentState) -> ResearchAgentState:
         design = design_research(state["intent"], settings=state["settings"])
-        return {
+        dataset_structure = build_target_dataset_structure(state["intent"], design)
+        build_run = None
+        if self.run_build_script:
+            build_script, build_run = generate_and_run_build_script(
+                intent=state["intent"],
+                design=design,
+                structure=dataset_structure,
+                dataset_rerank=state.get("dataset_rerank"),
+                settings=state["settings"],
+                output_dir=self.build_output_dir,
+                max_tries=self.max_build_tries,
+            )
+        else:
+            build_script = generate_build_script(
+                intent=state["intent"],
+                design=design,
+                structure=dataset_structure,
+                dataset_rerank=state.get("dataset_rerank"),
+                settings=state["settings"],
+            )
+        payload: ResearchAgentState = {
             "research_design": design,
+            "dataset_structure": dataset_structure,
+            "build_script": build_script,
+            "build_run": build_run,
             "result": OrchestrationResult(
                 status=OrchestrationStatus.DESIGN_READY,
                 intent=state["intent"],
@@ -315,8 +357,13 @@ class LangGraphResearchAgent:
                 dataset_rerank=state.get("dataset_rerank"),
                 explorer_datasets=state.get("explorer_datasets", []),
                 research_design=design,
+                dataset_structure=dataset_structure,
+                build_script=build_script,
+                build_run=build_run,
+                message="Сформированы дизайн исследования, структура датасета и скрипт сборки.",
             ),
         }
+        return payload
 
 
 def run_research_flow(
@@ -325,11 +372,17 @@ def run_research_flow(
     provider: str | None = None,
     model: str | None = None,
     use_defaults: bool = False,
+    run_build_script: bool = True,
+    build_output_dir: str = "artifacts/latest_run/generated_dataset",
+    max_build_tries: int = 3,
 ) -> OrchestrationResult:
     return LangGraphResearchAgent(
         settings=settings,
         provider=provider,
         model=model,
+        run_build_script=run_build_script,
+        build_output_dir=build_output_dir,
+        max_build_tries=max_build_tries,
     ).run(query, use_defaults=use_defaults)
 
 
@@ -339,11 +392,17 @@ def continue_research_flow(
     provider: str | None = None,
     model: str | None = None,
     use_defaults: bool = False,
+    run_build_script: bool = True,
+    build_output_dir: str = "artifacts/latest_run/generated_dataset",
+    max_build_tries: int = 3,
 ) -> OrchestrationResult:
     return LangGraphResearchAgent(
         settings=settings,
         provider=provider,
         model=model,
+        run_build_script=run_build_script,
+        build_output_dir=build_output_dir,
+        max_build_tries=max_build_tries,
     ).continue_from_intent(intent, use_defaults=use_defaults)
 
 

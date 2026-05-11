@@ -1,140 +1,210 @@
-import argparse
-import json
-import sys
-from typing import Any
+import shutil
+from pathlib import Path
 
 from openai import OpenAIError
 
-from dataset_reranker import (
-    DatasetRerankerError,
-    build_explorer_handoff,
-    rerank_dataset_candidates,
+from artifact_writer import WrittenArtifact, write_orchestration_artifacts
+from dataset_reranker import DatasetRerankerError
+from intent_parser import IntentParserError, parse_research_intent
+from orchestrator import (
+    ClarificationAnswer,
+    ClarificationRequest,
+    OrchestrationResult,
+    OrchestrationStatus,
+    continue_research_flow,
+    prepare_intent_for_design,
+    refine_intent_with_clarifications,
 )
-from hybrid_candidate_retriever import retrieve_candidate_datasets
-from intent_parser import IntentParserError, ResearchIntent, parse_research_intent
+from research_designer import ResearchDesignerError
+from script_generator import ScriptGeneratorError
 
 
-DEFAULT_QUERY = "Нужен годовой ВВП России в текущих и постоянных ценах"
+USER_PROMPT = "Статистика по инфляции между Россией и США за 2000-2020"
+LLM_PROVIDER: str | None = None
+LLM_MODEL: str | None = None
+USE_DEFAULTS = False
+RUN_BUILD_SCRIPT = True
+MAX_BUILD_TRIES = 3
+MAX_CLARIFICATION_ROUNDS = 3
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run temporary end-to-end RAG pipeline.")
-    parser.add_argument("query", nargs="*", help="Natural-language research request.")
-    parser.add_argument("--provider", choices=["qwen", "yandex"], default=None)
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--candidate-limit", type=int, default=30)
-    parser.add_argument("--top-n", type=int, default=5)
-    return parser.parse_args()
+ARTIFACT_DIR = Path("artifacts/latest_run")
+DATASET_OUTPUT_DIR = ARTIFACT_DIR / "generated_dataset"
 
 
 def main() -> None:
-    args = parse_args()
-    query = " ".join(args.query).strip() or DEFAULT_QUERY
+    prompt = USER_PROMPT.strip()
+    if not prompt:
+        raise SystemExit("Ошибка: USER_PROMPT не должен быть пустым.")
+
+    _reset_artifact_dir()
 
     try:
-        result = run_pipeline(
-            query=query,
-            provider=args.provider,
-            model=args.model,
-            candidate_limit=args.candidate_limit,
-            top_n=args.top_n,
+        result = _run_flow_with_clarifications(prompt)
+        artifacts = write_orchestration_artifacts(
+            result,
+            output_dir=ARTIFACT_DIR,
+            dataset_output_dir=DATASET_OUTPUT_DIR,
         )
     except (
         RuntimeError,
-        IntentParserError,
-        DatasetRerankerError,
         ValueError,
         OpenAIError,
+        IntentParserError,
+        DatasetRerankerError,
+        ResearchDesignerError,
+        ScriptGeneratorError,
     ) as exc:
-        print(f"Ошибка: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
+        raise SystemExit(f"Ошибка: {exc}") from exc
 
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    _print_summary(result, artifacts)
 
 
-def run_pipeline(
-    query: str,
-    provider: str | None = None,
-    model: str | None = None,
-    candidate_limit: int = 30,
-    top_n: int = 5,
-) -> dict[str, Any]:
-    print("этап 1: intent parsing", file=sys.stderr, flush=True)
-    intent = parse_research_intent(query, provider=provider, model=model)
-
-    print("этап 2: Chroma + BM25 retrieval", file=sys.stderr, flush=True)
-    candidates = retrieve_candidate_datasets(
-        intent,
-        candidate_top_k=candidate_limit,
+def _run_flow_with_clarifications(query: str) -> OrchestrationResult:
+    print("Этап 1: формализация запроса")
+    intent = parse_research_intent(
+        query,
+        provider=LLM_PROVIDER,
+        model=LLM_MODEL,
     )
 
-    print("этап 3: LLM reranker", file=sys.stderr, flush=True)
-    rerank_response = rerank_dataset_candidates(
-        user_query=intent.original_query,
-        candidates=candidates,
-        provider=provider,
-        model=model,
-        top_n=top_n,
-        candidate_limit=candidate_limit,
-    )
+    for round_number in range(1, MAX_CLARIFICATION_ROUNDS + 1):
+        readiness = prepare_intent_for_design(intent, use_defaults=USE_DEFAULTS)
+        if readiness.status == OrchestrationStatus.READY_FOR_DESIGN:
+            print("Этап 2: RAG, дизайн исследования, генерация и запуск сборки")
+            return continue_research_flow(
+                intent,
+                provider=LLM_PROVIDER,
+                model=LLM_MODEL,
+                use_defaults=USE_DEFAULTS,
+                run_build_script=RUN_BUILD_SCRIPT,
+                build_output_dir=str(DATASET_OUTPUT_DIR),
+                max_build_tries=MAX_BUILD_TRIES,
+            )
 
-    handoff = build_explorer_handoff(rerank_response, include_source=True)
+        if readiness.status != OrchestrationStatus.NEEDS_CLARIFICATION:
+            return readiness
 
-    return {
-        "query": query,
-        "intent": _intent_payload(intent),
-        "retrieval": {
-            "candidate_count": len(candidates),
-            "top_candidates": [_candidate_payload(candidate) for candidate in candidates[:10]],
-        },
-        "reranker": rerank_response.model_dump(mode="json"),
-        "explorer_handoff": handoff,
-        "evaluation": _evaluate_pipeline(candidates, handoff, rerank_response.no_results_reason),
-    }
+        print(f"Нужно уточнение запроса, раунд {round_number}/{MAX_CLARIFICATION_ROUNDS}")
+        answers = _collect_clarification_answers(readiness.clarification_requests)
+        intent = refine_intent_with_clarifications(
+            intent,
+            answers,
+            provider=LLM_PROVIDER,
+            model=LLM_MODEL,
+        )
 
+    readiness = prepare_intent_for_design(intent, use_defaults=USE_DEFAULTS)
+    if readiness.status == OrchestrationStatus.READY_FOR_DESIGN:
+        return continue_research_flow(
+            intent,
+            provider=LLM_PROVIDER,
+            model=LLM_MODEL,
+            use_defaults=USE_DEFAULTS,
+            run_build_script=RUN_BUILD_SCRIPT,
+            build_output_dir=str(DATASET_OUTPUT_DIR),
+            max_build_tries=MAX_BUILD_TRIES,
+        )
 
-def _intent_payload(intent: ResearchIntent) -> dict[str, Any]:
-    return {
-        "schema_version": intent.schema_version,
-        "original_query": intent.original_query,
-        "english_query": intent.english_query,
-        "keyword_synonyms": [
-            item.model_dump(mode="json") for item in intent.keyword_synonyms
-        ],
-        "intent_type": intent.intent_type.value,
-        "complexity": intent.complexity.value,
-        "topic": intent.topic,
-        "geography": intent.geography,
-        "time_range": intent.time_range.model_dump(mode="json") if intent.time_range else None,
-        "frequency": intent.frequency,
-        "indicators": intent.indicators,
-        "next_action": intent.next_action.value,
-        "confidence": intent.confidence,
-    }
+    fields = ", ".join(item.field for item in readiness.clarification_requests)
+    raise RuntimeError(f"Не удалось уточнить запрос. Остались поля: {fields or readiness.status.value}.")
 
 
-def _candidate_payload(candidate: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "record_id": candidate.get("record_id"),
-        "dataset_id": candidate.get("dataset_id"),
-        "title": candidate.get("title"),
-        "source": candidate.get("source"),
-        "matched_by": candidate.get("matched_by", []),
-        "data_path": candidate.get("data_path"),
-    }
+def _collect_clarification_answers(
+    requests: list[ClarificationRequest],
+) -> list[ClarificationAnswer]:
+    answers: list[ClarificationAnswer] = []
+    for index, request in enumerate(requests, start=1):
+        print("")
+        print(f"Уточнение {index}/{len(requests)}: {request.question}")
+        print(f"Причина: {request.reason}")
+        if request.default_assumption:
+            print(f"Можно нажать Enter для default: {request.default_assumption}")
+
+        answer = input("Ответ: ").strip()
+        used_default = False
+        if not answer and request.default_assumption:
+            answer = request.default_assumption
+            used_default = True
+        if not answer:
+            raise RuntimeError("Уточнение обязательно, чтобы продолжить.")
+
+        answers.append(
+            ClarificationAnswer(
+                field=request.field,
+                question=request.question,
+                answer=answer,
+                used_default=used_default,
+            )
+        )
+
+    return answers
 
 
-def _evaluate_pipeline(
-    candidates: list[dict[str, Any]],
-    handoff: list[dict[str, str | None]],
-    no_results_reason: str | None,
-) -> dict[str, Any]:
-    return {
-        "retrieval_returned_candidates": bool(candidates),
-        "reranker_returned_results": bool(handoff),
-        "ready_for_explorer": bool(handoff),
-        "no_results_reason": no_results_reason,
-    }
+def _reset_artifact_dir() -> None:
+    if ARTIFACT_DIR.exists():
+        shutil.rmtree(ARTIFACT_DIR)
+    DATASET_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _print_summary(
+    result: OrchestrationResult,
+    artifacts: list[WrittenArtifact],
+) -> None:
+    print("Готово.")
+    print(f"Статус: {result.status.value}")
+    print(f"Артефакты: {ARTIFACT_DIR.resolve()}")
+
+    report_path = _artifact_path(artifacts, "research_report")
+    if report_path:
+        print(f"Отчет: {report_path}")
+
+    script_path = _artifact_path(artifacts, "build_script_file")
+    if script_path:
+        print(f"Код сборки: {script_path}")
+
+    if result.build_run:
+        print(f"Датасет и результат запуска: {Path(result.build_run.output_dir).resolve()}")
+        print(f"Статус сборки: {result.build_run.status}")
+
+    if result.clarification_requests:
+        print("Нужны уточнения:")
+        for item in result.clarification_requests:
+            print(f"- {item.question}")
+            if item.default_assumption:
+                print(f"  default: {item.default_assumption}")
+
+    limitations = _limitations(result)
+    if limitations:
+        print("Ограничения:")
+        for item in limitations:
+            print(f"- {item}")
+
+
+def _artifact_path(artifacts: list[WrittenArtifact], artifact_type: str) -> str | None:
+    for artifact in artifacts:
+        if artifact.artifact_type == artifact_type:
+            return artifact.path
+    return None
+
+
+def _limitations(result: OrchestrationResult) -> list[str]:
+    values: list[str] = []
+    if result.dataset_rerank:
+        for item in result.dataset_rerank.results:
+            values.extend(item.possible_limitations)
+    if result.build_script:
+        values.extend(result.build_script.possible_limitations)
+    if result.build_run and isinstance(result.build_run.output, dict):
+        output_limitations = (
+            result.build_run.output.get("limitations")
+            or result.build_run.output.get("possible_limitations")
+            or []
+        )
+        if isinstance(output_limitations, list):
+            values.extend(str(item) for item in output_limitations)
+        elif output_limitations:
+            values.append(str(output_limitations))
+    return list(dict.fromkeys(item for item in values if item.strip()))
 
 
 if __name__ == "__main__":
