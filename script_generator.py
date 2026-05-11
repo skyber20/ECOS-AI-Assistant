@@ -20,6 +20,11 @@ from intent_parser import (
 )
 from research_designer import ResearchStudyDesign
 
+SUPPORTED_SOURCE_FORMATS = frozenset({".parquet", ".csv", ".tsv", ".json", ".jsonl", ".jsonl.gz"})
+SQL_VALIDATION_REPAIRS = 2
+SAMPLE_ROW_LIMIT = 8
+SAMPLE_VALUE_MAX_LENGTH = 240
+
 
 class GeneratedOutputSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -85,6 +90,7 @@ SQL_GENERATION_PROMPT = """Ты генерируешь DuckDB SQL для сбо�
 - source_tables: локальные файлы, уже подключаемые executor как SQL-таблицы;
 - source_datasets: metadata и lineage найденных RAG источников;
 - execution_contract: правила SQL-запуска.
+- source_tables[].sample_rows: несколько первых строк только для понимания формы таблицы и типов значений.
 
 Правила:
 - Верни только валидный JSON GeneratedBuildScript без Markdown.
@@ -94,11 +100,15 @@ SQL_GENERATION_PROMPT = """Ты генерируешь DuckDB SQL для сбо�
 - Не пиши Python, CLI, DDL, DML, COPY, CREATE, INSERT, UPDATE, DELETE, DROP, ALTER, INSTALL, LOAD.
 - Не вызывай read_parquet/read_csv/read_json и не указывай файловые пути. Файлы уже доступны как таблицы source_1, source_2 и так далее.
 - Используй только таблицы и колонки из source_tables.
+- sample_rows используй только чтобы понять форму таблицы, заголовочные строки и типы значений. Не считай sample_rows полным набором данных.
 - Итоговый SELECT должен вернуть только колонки из target_structure.columns, в том же смысле и по возможности в том же порядке.
 - Обязательные dimension-колонки, например geo/year, должны быть заполнены, иначе запрос считается неготовым.
 - Для lineage используй литералы из source_tables: source_name, source_url, source_dataset_id.
 - Все фильтры периода, географии, объектов, частоты и показателей бери из intent, target_structure и research_design.
+- Не добавляй фильтры качества вроде value > 0 или IS NOT NULL для показателей, если это прямо не следует из intent, metadata или schema.
 - Не выдумывай отсутствующие показатели. Если source schema не содержит нужной колонки или источник дает не тот показатель, не синтезируй значения, укажи limitation.
+- Если source_tables недостаточны для сборки целевого датасета без выдумывания данных, верни пустой SELECT по target_structure.columns с WHERE FALSE без FROM source_* и подробно укажи причины в possible_limitations.
+- Если годы или периоды представлены отдельными колонками, приведи их к целевой длинной структуре по фактическим именам колонок.
 - Если source_datasets содержит данные только в процентах роста, не называй их уровнем индекса.
 - possible_limitations пиши по-русски, предметно, только из metadata/schema/context.
 - usage коротко объясняет, что SQL выполняется executor через DuckDB поверх source_* таблиц.
@@ -121,6 +131,7 @@ SQL_REPAIR_PROMPT = """Ты исправляешь DuckDB SQL для сборк�
 - Не используй Python, CLI, DDL, DML, COPY, CREATE, INSERT, UPDATE, DELETE, DROP, ALTER, INSTALL, LOAD.
 - Не читай файлы в SQL. Используй только source_* таблицы и их колонки.
 - Не выдумывай отсутствующие значения.
+- Если ошибку нельзя исправить без выдумывания данных, верни пустой SELECT по target_structure.columns с WHERE FALSE без FROM source_* и укажи ограничения.
 """
 
 
@@ -272,16 +283,40 @@ def _parse_generated_script(
     settings: LLMSettings,
     context: dict[str, Any],
 ) -> GeneratedBuildScript:
-    script = parse_llm_json_model(
-        content,
-        GeneratedBuildScript,
-        settings=settings,
-        error_type=ScriptGeneratorError,
-        context=context,
-    )
-    script.content = _normalized_sql(script.content)
-    _validate_sql_content(script.content)
-    return script
+    current_content = content
+    last_error: ScriptGeneratorError | None = None
+    for repair_number in range(SQL_VALIDATION_REPAIRS + 1):
+        script = parse_llm_json_model(
+            current_content,
+            GeneratedBuildScript,
+            settings=settings,
+            error_type=ScriptGeneratorError,
+            context=context,
+        )
+        script.content = _normalized_sql(script.content)
+        try:
+            _validate_sql_content(script.content)
+            return script
+        except ScriptGeneratorError as exc:
+            last_error = exc
+            if repair_number >= SQL_VALIDATION_REPAIRS:
+                break
+            current_content = _create_schema_completion(
+                settings,
+                _repair_messages(
+                    script,
+                    context,
+                    ScriptExecutionAttempt(
+                        attempt=repair_number + 1,
+                        ok=False,
+                        error=str(exc),
+                    ),
+                ),
+                GeneratedBuildScript,
+                "GeneratedBuildScript",
+            )
+
+    raise last_error or ScriptGeneratorError("SQL не прошел валидацию.")
 
 
 def _repair_script(
@@ -358,7 +393,7 @@ def _execute_script(
 
     row_count = output.get("row_count", 0)
     has_readable_sources = any(table.get("path_exists") for table in context.get("source_tables", []))
-    if row_count == 0 and has_readable_sources:
+    if row_count == 0 and has_readable_sources and _query_uses_readable_source(script.content, context):
         return ScriptExecutionAttempt(
             attempt=attempt_number,
             ok=False,
@@ -466,17 +501,8 @@ def _run_duckdb_sql(
 def _create_source_view(con: Any, table: dict[str, Any]) -> None:
     path = _sql_string(table["resolved_path"])
     name = _sql_identifier(table["table_name"])
-    file_format = table.get("file_format")
-    if file_format == ".parquet":
-        con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet({path})")
-        return
-    if file_format in {".csv", ".tsv"}:
-        con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_csv_auto({path}, header=true)")
-        return
-    if file_format in {".json", ".jsonl", ".jsonl.gz"}:
-        con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_json_auto({path})")
-        return
-    raise ScriptGeneratorError(f"Формат источника не поддержан SQL executor: {file_format}")
+    relation = _source_relation_sql(path, table.get("file_format"))
+    con.execute(f"CREATE VIEW {name} AS SELECT * FROM {relation}")
 
 
 def _validate_sql_content(content: str) -> None:
@@ -505,6 +531,15 @@ def _validate_sql_content(content: str) -> None:
     for token in forbidden:
         if token in lowered:
             raise ScriptGeneratorError(f"SQL содержит запрещенный фрагмент: {token.strip()}")
+
+
+def _query_uses_readable_source(content: str, context: dict[str, Any]) -> bool:
+    lowered = _normalized_sql(content).lower()
+    return any(
+        table.get("path_exists")
+        and re.search(rf"\b{re.escape(str(table.get('table_name', '')).lower())}\b", lowered)
+        for table in context.get("source_tables", [])
+    )
 
 
 def _normalized_sql(content: str) -> str:
@@ -637,21 +672,25 @@ def _source_table_payloads(source_datasets: list[dict[str, Any]]) -> list[dict[s
     for index, source in enumerate(source_datasets, start=1):
         resolved_path = source.get("resolved_data_path")
         file_format = source.get("file_format")
-        if not resolved_path or file_format not in {".parquet", ".csv", ".tsv", ".json", ".jsonl", ".jsonl.gz"}:
+        if not resolved_path or file_format not in SUPPORTED_SOURCE_FORMATS:
             continue
         path = Path(resolved_path)
         table = {
             "table_name": f"source_{index}",
             "record_id": source.get("record_id"),
             "dataset_id": source.get("dataset_id"),
+            "source_dataset_id": source.get("dataset_id"),
             "title": source.get("title"),
             "source": source.get("source"),
             "source_name": source.get("title") or source.get("source"),
             "source_url": source.get("source_url"),
+            "unit": source.get("unit"),
+            "frequency": source.get("frequency"),
             "resolved_path": str(path),
             "file_format": file_format,
             "path_exists": path.exists(),
             "columns": _inspect_schema(path, file_format) if path.exists() else [],
+            "sample_rows": _sample_rows(path, file_format) if path.exists() else [],
             "possible_limitations": source.get("possible_limitations") or [],
         }
         tables.append(table)
@@ -659,17 +698,19 @@ def _source_table_payloads(source_datasets: list[dict[str, Any]]) -> list[dict[s
 
 
 def _inspect_schema(path: Path, file_format: str | None) -> list[dict[str, str | None]]:
-    if file_format == ".parquet":
+    if find_spec("duckdb") is not None:
         try:
-            import pyarrow.parquet as pq
+            import duckdb
 
-            schema = pq.ParquetFile(path).schema_arrow
-            return [
-                {"name": field.name, "dtype": str(field.type)}
-                for field in schema
-            ]
+            relation = _source_relation_sql(_sql_string(str(path)), file_format)
+            con = duckdb.connect(database=":memory:")
+            try:
+                rows = con.execute(f"DESCRIBE SELECT * FROM {relation}").fetchall()
+            finally:
+                con.close()
+            return [{"name": row[0], "dtype": row[1]} for row in rows]
         except Exception:
-            return []
+            pass
     if file_format in {".csv", ".tsv"}:
         delimiter = "\t" if file_format == ".tsv" else ","
         try:
@@ -679,6 +720,49 @@ def _inspect_schema(path: Path, file_format: str | None) -> list[dict[str, str |
         except Exception:
             return []
     return []
+
+
+def _sample_rows(path: Path, file_format: str | None) -> list[dict[str, Any]]:
+    if find_spec("duckdb") is None:
+        return []
+    try:
+        import duckdb
+
+        relation = _source_relation_sql(_sql_string(str(path)), file_format)
+        con = duckdb.connect(database=":memory:")
+        try:
+            cursor = con.execute(f"SELECT * FROM {relation} LIMIT {SAMPLE_ROW_LIMIT}")
+            columns = [item[0] for item in cursor.description or []]
+            rows = cursor.fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return []
+    return [
+        {name: _sample_value(value) for name, value in zip(columns, row)}
+        for row in rows
+    ]
+
+
+def _sample_value(value: Any) -> Any:
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    text = str(value).strip()
+    if len(text) > SAMPLE_VALUE_MAX_LENGTH:
+        return text[:SAMPLE_VALUE_MAX_LENGTH]
+    return text
+
+
+def _source_relation_sql(path: str, file_format: str | None) -> str:
+    if file_format == ".parquet":
+        return f"read_parquet({path})"
+    if file_format == ".csv":
+        return f"read_csv_auto({path}, header=true)"
+    if file_format == ".tsv":
+        return f"read_csv_auto({path}, delim='\\t', header=true)"
+    if file_format in {".json", ".jsonl", ".jsonl.gz"}:
+        return f"read_json_auto({path})"
+    raise ScriptGeneratorError(f"Формат источника не поддержан SQL executor: {file_format}")
 
 
 def _available_libraries() -> dict[str, bool]:
