@@ -7,17 +7,16 @@ from pathlib import Path
 from typing import Any, Literal
 
 from openai import BadRequestError
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from dataset_reranker import DatasetRerankResponse
 from dataset_structure import TargetDatasetStructure
 from intent_parser import (
-    IntentParserError,
     LLMSettings,
     ResearchIntent,
-    _load_json_object,
     create_llm_settings,
     none_to_empty_list,
+    parse_llm_json_model,
 )
 from research_designer import ResearchStudyDesign
 
@@ -149,7 +148,7 @@ def generate_build_script(
         GeneratedBuildScript,
         "GeneratedBuildScript",
     )
-    return _parse_generated_script(content)
+    return _parse_generated_script(content, llm_settings, context)
 
 
 def generate_and_run_build_script(
@@ -268,17 +267,18 @@ def _repair_messages(
     ]
 
 
-def _parse_generated_script(content: str) -> GeneratedBuildScript:
-    try:
-        data = _load_json_object(content)
-    except (IntentParserError, json.JSONDecodeError) as exc:
-        raise ScriptGeneratorError(f"LLM вернула невалидный JSON SQL: {exc}") from exc
-
-    try:
-        script = GeneratedBuildScript.model_validate(data)
-    except ValidationError as exc:
-        raise ScriptGeneratorError(f"JSON SQL не соответствует контракту: {exc}") from exc
-
+def _parse_generated_script(
+    content: str,
+    settings: LLMSettings,
+    context: dict[str, Any],
+) -> GeneratedBuildScript:
+    script = parse_llm_json_model(
+        content,
+        GeneratedBuildScript,
+        settings=settings,
+        error_type=ScriptGeneratorError,
+        context=context,
+    )
     script.content = _normalized_sql(script.content)
     _validate_sql_content(script.content)
     return script
@@ -296,7 +296,7 @@ def _repair_script(
         GeneratedBuildScript,
         "GeneratedBuildScript",
     )
-    return _parse_generated_script(content)
+    return _parse_generated_script(content, settings, context)
 
 
 def _create_schema_completion(

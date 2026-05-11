@@ -22,7 +22,7 @@ from intent_parser import (
     ResearchIntent,
     SYSTEM_PROMPT,
     _create_json_completion,
-    _parse_intent_json,
+    _parse_intent_json_with_repair,
     create_llm_settings,
 )
 from research_designer import ResearchStudyDesign, design_research
@@ -275,7 +275,11 @@ class LangGraphResearchAgent:
             ],
         )
         return {
-            "intent": _parse_intent_json(content, original_query=query),
+            "intent": _parse_intent_json_with_repair(
+                content,
+                original_query=query,
+                settings=state["settings"],
+            ),
         }
 
     def _refine_intent_node(self, state: ResearchAgentState) -> ResearchAgentState:
@@ -287,9 +291,10 @@ class LangGraphResearchAgent:
             ),
         )
         return {
-            "intent": _parse_intent_json(
+            "intent": _parse_intent_json_with_repair(
                 content,
                 original_query=state["intent"].original_query,
+                settings=state["settings"],
             ),
         }
 
