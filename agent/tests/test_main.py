@@ -71,7 +71,7 @@ class MainFlowTest(unittest.TestCase):
         )
         agent = _FakeResearchAgent(initial_intent, refined_intent, design_result)
 
-        with patch("main.LangGraphResearchAgent", return_value=agent):
+        with patch("agent.main.LangGraphResearchAgent", return_value=agent):
             result = run_interactive_research_flow(
                 "Дай данные по инфляции.",
                 input_stream=io.StringIO("Россия\n2020-2024\n"),

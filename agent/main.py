@@ -3,14 +3,24 @@ import json
 import sys
 from typing import TextIO
 
-from orchestrator import (
-    ClarificationAnswer,
-    ClarificationRequest,
-    LangGraphResearchAgent,
-    OrchestrationResult,
-    OrchestrationStatus,
-    prepare_intent_for_design,
-)
+try:
+    from agent.orchestrator import (
+        ClarificationAnswer,
+        ClarificationRequest,
+        LangGraphResearchAgent,
+        OrchestrationResult,
+        OrchestrationStatus,
+        prepare_intent_for_design,
+    )
+except ImportError:  # pragma: no cover - keeps direct `python agent/...` runs working.
+    from orchestrator import (  # type: ignore
+        ClarificationAnswer,
+        ClarificationRequest,
+        LangGraphResearchAgent,
+        OrchestrationResult,
+        OrchestrationStatus,
+        prepare_intent_for_design,
+    )
 
 
 MAX_CLARIFICATION_ROUNDS = 3
