@@ -14,6 +14,7 @@ from intent_parser import (
     create_llm_settings,
     none_to_empty_list,
 )
+from schema_sanitizer import strip_extra_fields
 
 
 class Hypothesis(BaseModel):
@@ -247,7 +248,9 @@ def _parse_design_json(content: str, intent: ResearchIntent) -> ResearchStudyDes
         data["original_query"] = intent.original_query
 
     try:
-        design = ResearchStudyDesign.model_validate(data)
+        design = ResearchStudyDesign.model_validate(
+            strip_extra_fields(ResearchStudyDesign, data)
+        )
     except ValidationError as exc:
         raise ResearchDesignerError(
             f"LLM JSON does not match ResearchStudyDesign schema: {exc}"

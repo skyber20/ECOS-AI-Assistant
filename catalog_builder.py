@@ -9,8 +9,17 @@ from typing import Any, Iterable
 
 
 ROOT = Path(__file__).resolve().parent
-WB_DIR = ROOT / "data" / "dumps" / "wb" / "wb"
-FEDSTAT_DIR = ROOT / "data" / "dumps" / "fedstatru" / "fedstatru" / "data"
+DUMPS_DIR = ROOT / "dumps"
+DATA_DIR = ROOT / "data"
+WB_ARCHIVE_PATH = DUMPS_DIR / "wb" / "data.zip"
+FEDSTAT_ARCHIVE_PATH = DUMPS_DIR / "fedstatru" / "fedstatru.zip"
+WB_DIR = DUMPS_DIR / "wb" / "wb"
+FEDSTAT_DIR = DUMPS_DIR / "fedstatru" / "fedstatru" / "data"
+CATALOG_RECORDS_PATH = DATA_DIR / "catalog_records.jsonl"
+CATALOG_DOCUMENTS_PATH = DATA_DIR / "catalog_documents.jsonl"
+CATALOG_BM25_INDEX_PATH = DATA_DIR / "catalog_bm25.sqlite"
+CHROMA_DIR = DATA_DIR / "chroma"
+EMBEDDING_CACHE_DIR = DATA_DIR / "embedding_cache"
 EMPTY_TEXT = {"", "-", "null", "none", "nan"}
 
 SCHEMA = (
@@ -39,7 +48,7 @@ SCHEMA = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build metadata-only catalog records.")
-    parser.add_argument("--output", default="data/catalog_records.jsonl")
+    parser.add_argument("--output", default=str(CATALOG_RECORDS_PATH))
     return parser.parse_args()
 
 
@@ -204,7 +213,7 @@ def build_wb_records() -> list[dict[str, Any]]:
 
 
 def load_fedstat_csv() -> dict[str, dict[str, Any]]:
-    path = FEDSTAT_DIR / "metdata.xlsx"
+    path = FEDSTAT_DIR / "metdata.csv"
     with path.open(newline="", encoding="utf-8-sig") as file:
         rows = {}
         for row in csv.DictReader(file):
@@ -232,7 +241,7 @@ def fedstat_metadata_path(code: str, csv_rows: dict[str, dict[str, Any]], json_r
     if code in json_rows:
         return relative(FEDSTAT_DIR / "metadata" / f"{code}.json")
     if code in csv_rows:
-        return relative(FEDSTAT_DIR / "metdata.xlsx")
+        return relative(FEDSTAT_DIR / "metdata.csv")
     return relative(FEDSTAT_DIR / "invalid_files.json")
 
 
@@ -251,7 +260,9 @@ def build_fedstat_records() -> list[dict[str, Any]]:
         row = merge_missing(csv_rows.get(code, {}), json_rows.get(code, {}))
         is_invalid = code in invalid_codes
         dimensions = split_marked(row.get("Признаки (перечень на базе классификаторов и справочников)"))
-        data_path = FEDSTAT_DIR / "parquet" / f"{code}.parquet"
+        jsonl_path = FEDSTAT_DIR / "clean_jsonl" / f"{code}.jsonl.gz"
+        parquet_path = FEDSTAT_DIR / "parquet" / f"{code}.parquet"
+        data_path = jsonl_path if jsonl_path.exists() else parquet_path
 
         records.append(validate_record(base_record(
             record_id=f"fedstat:{code}",
@@ -284,6 +295,7 @@ def build_catalog() -> list[dict[str, Any]]:
 
 
 def write_jsonl(records: Iterable[dict[str, Any]], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as file:
         for record in records:
             file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")

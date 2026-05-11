@@ -5,12 +5,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from catalog_builder import ROOT, clean_text, relative
+from catalog_builder import (
+    CATALOG_DOCUMENTS_PATH,
+    CHROMA_DIR,
+    EMBEDDING_CACHE_DIR,
+    ROOT,
+    clean_text,
+    relative,
+)
 
 
-CATALOG_DOCUMENTS_PATH = ROOT / "data" / "catalog_documents.jsonl"
-CHROMA_DIR = ROOT / "data" / "chroma"
-EMBEDDING_CACHE_DIR = ROOT / "data" / "embedding_cache"
 COLLECTION_NAME = "catalog_documents"
 EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
 TEXT_INSTRUCTION = "passage: "

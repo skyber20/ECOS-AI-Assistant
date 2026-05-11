@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from catalog_builder import ROOT
+from catalog_builder import CATALOG_RECORDS_PATH, ROOT
 from intent_parser import (
     IntentParserError,
     LLMSettings,
@@ -13,9 +13,9 @@ from intent_parser import (
     create_llm_settings,
     none_to_empty_list,
 )
+from schema_sanitizer import strip_extra_fields
 
 
-CATALOG_RECORDS_PATH = ROOT / "data" / "catalog_records.jsonl"
 LLM_CANDIDATE_LIMIT = 30
 MIN_TOP_RESULTS = 3
 MAX_TOP_RESULTS = 7
@@ -259,7 +259,9 @@ def _parse_rerank_json(content: str) -> DatasetRerankResponse:
         raise DatasetRerankerError(f"LLM returned invalid rerank JSON: {exc}") from exc
 
     try:
-        return DatasetRerankResponse.model_validate(data)
+        return DatasetRerankResponse.model_validate(
+            strip_extra_fields(DatasetRerankResponse, data)
+        )
     except ValidationError as exc:
         raise DatasetRerankerError(f"LLM JSON does not match DatasetRerankResponse schema: {exc}") from exc
 

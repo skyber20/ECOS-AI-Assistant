@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from openai import BadRequestError, OpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from schema_sanitizer import strip_extra_fields
+
 
 FREQUENCY_ALIASES = {
     "annual": "годовая",
@@ -514,7 +516,7 @@ def _parse_intent_json(content: str, original_query: str) -> ResearchIntent:
         data["original_query"] = original_query
 
     try:
-        intent = ResearchIntent.model_validate(data)
+        intent = ResearchIntent.model_validate(strip_extra_fields(ResearchIntent, data))
     except ValidationError as exc:
         raise IntentParserError(f"LLM JSON does not match ResearchIntent schema: {exc}") from exc
 

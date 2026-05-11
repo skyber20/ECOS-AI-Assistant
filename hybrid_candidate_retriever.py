@@ -5,11 +5,8 @@ from typing import Any
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
-import chromadb
-from sentence_transformers import SentenceTransformer
-
 from catalog_bm25_indexer import search_bm25
-from catalog_builder import ROOT
+from catalog_builder import CATALOG_RECORDS_PATH, ROOT
 from catalog_chroma_indexer import (
     CHROMA_DIR,
     COLLECTION_NAME,
@@ -22,7 +19,6 @@ from catalog_chroma_indexer import (
 VECTOR_TOP_K = 15
 BM25_TOP_K = 15
 CANDIDATE_TOP_K = 30
-CATALOG_RECORDS_PATH = ROOT / "data" / "catalog_records.jsonl"
 CANDIDATE_FIELDS = (
     "record_id",
     "dataset_id",
@@ -50,6 +46,8 @@ def retrieve_candidate_datasets(
     candidate_top_k: int = CANDIDATE_TOP_K,
 ) -> list[dict[str, Any]]:
     query = _clean_query(user_query)
+    if not CATALOG_RECORDS_PATH.exists():
+        return []
     vector_results = _search_vector(query, vector_top_k)
     bm25_results = search_bm25(query, top_k=bm25_top_k)
     return _merge_candidates(vector_results, bm25_results)[:candidate_top_k]
@@ -58,19 +56,27 @@ def retrieve_candidate_datasets(
 def _search_vector(query: str, top_k: int) -> list[dict[str, Any]]:
     if top_k <= 0:
         return []
+    if not CHROMA_DIR.exists():
+        return []
 
-    embedding = _embedding_model().encode(
-        [f"{QUERY_INSTRUCTION}{query}"],
-        normalize_embeddings=True,
-    )[0].tolist()
-    collection = chromadb.PersistentClient(path=str(CHROMA_DIR)).get_collection(
-        COLLECTION_NAME,
-    )
-    result = collection.query(
-        query_embeddings=[embedding],
-        n_results=top_k,
-        include=["metadatas", "distances"],
-    )
+    try:
+        import chromadb
+
+        embedding = _embedding_model().encode(
+            [f"{QUERY_INSTRUCTION}{query}"],
+            normalize_embeddings=True,
+        )[0].tolist()
+        collection = chromadb.PersistentClient(path=str(CHROMA_DIR)).get_collection(
+            COLLECTION_NAME,
+        )
+        result = collection.query(
+            query_embeddings=[embedding],
+            n_results=top_k,
+            include=["metadatas", "distances"],
+        )
+    except Exception:
+        return []
+
     metadatas = result.get("metadatas", [[]])[0]
     distances = result.get("distances", [[]])[0]
     return [
@@ -138,7 +144,9 @@ def _catalog_records() -> dict[str, dict[str, Any]]:
 
 
 @lru_cache(maxsize=1)
-def _embedding_model() -> SentenceTransformer:
+def _embedding_model():
+    from sentence_transformers import SentenceTransformer
+
     return SentenceTransformer(
         EMBEDDING_MODEL,
         cache_folder=str(EMBEDDING_CACHE_DIR),

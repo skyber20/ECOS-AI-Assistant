@@ -3,6 +3,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from assembly_planner import DatasetBuildPlan, plan_dataset_build
+from dataset_structure import TargetDatasetStructure, build_target_dataset_structure
 from intent_parser import (
     IntentType,
     IntentParserError,
@@ -15,6 +17,7 @@ from intent_parser import (
     parse_research_intent,
 )
 from research_designer import ResearchStudyDesign, design_research
+from script_generator import GeneratedBuildScript, generate_build_script
 
 
 class OrchestrationStatus(str, Enum):
@@ -50,6 +53,9 @@ class OrchestrationResult(BaseModel):
     intent: ResearchIntent
     clarification_requests: list[ClarificationRequest] = Field(default_factory=list)
     research_design: ResearchStudyDesign | None = None
+    dataset_structure: TargetDatasetStructure | None = None
+    build_plan: DatasetBuildPlan | None = None
+    build_script: GeneratedBuildScript | None = None
     message: str | None = None
 
     @field_validator("clarification_requests", mode="before")
@@ -82,6 +88,7 @@ def run_research_flow(
     provider: str | None = None,
     model: str | None = None,
     use_defaults: bool = False,
+    use_registry: bool = True,
 ) -> OrchestrationResult:
     intent = parse_research_intent(
         query,
@@ -94,6 +101,7 @@ def run_research_flow(
         provider=provider,
         model=model,
         use_defaults=use_defaults,
+        use_registry=use_registry,
     )
 
 
@@ -103,6 +111,7 @@ def continue_research_flow(
     provider: str | None = None,
     model: str | None = None,
     use_defaults: bool = False,
+    use_registry: bool = True,
 ) -> OrchestrationResult:
     readiness = prepare_intent_for_design(intent, use_defaults=use_defaults)
     if readiness.status != OrchestrationStatus.READY_FOR_DESIGN:
@@ -114,11 +123,36 @@ def continue_research_flow(
         provider=provider,
         model=model,
     )
+    if not design.can_continue:
+        return OrchestrationResult(
+            status=OrchestrationStatus.DESIGN_READY,
+            intent=intent,
+            clarification_requests=[] if use_defaults else readiness.clarification_requests,
+            research_design=design,
+            message="Дизайн исследования построен, но дальнейшая сборка заблокирована.",
+        )
+
+    dataset_structure = build_target_dataset_structure(intent, design)
+    build_plan = plan_dataset_build(
+        intent=intent,
+        design=design,
+        structure=dataset_structure,
+        settings=settings,
+        provider=provider,
+        model=model,
+        use_registry=use_registry,
+    )
+    build_script = generate_build_script(dataset_structure, build_plan)
+
     return OrchestrationResult(
         status=OrchestrationStatus.DESIGN_READY,
         intent=intent,
         clarification_requests=[] if use_defaults else readiness.clarification_requests,
         research_design=design,
+        dataset_structure=dataset_structure,
+        build_plan=build_plan,
+        build_script=build_script,
+        message="Сформированы дизайн исследования, структура датасета, план сборки и скрипт.",
     )
 
 

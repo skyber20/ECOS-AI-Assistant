@@ -5,16 +5,17 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-from catalog_builder import ROOT, clean_text, relative
+from catalog_builder import CATALOG_BM25_INDEX_PATH, CATALOG_DOCUMENTS_PATH, ROOT, clean_text, relative
 
 
-DEFAULT_DOCUMENTS_PATH = ROOT / "data" / "catalog_documents.jsonl"
-DEFAULT_INDEX_PATH = ROOT / "data" / "catalog_bm25.sqlite"
+DEFAULT_DOCUMENTS_PATH = CATALOG_DOCUMENTS_PATH
+DEFAULT_INDEX_PATH = CATALOG_BM25_INDEX_PATH
 
 LEXICAL_FIELDS = (
     "record_id",
     "dataset_id",
     "title",
+    "search_text",
     "tags",
     "dimensions",
     "source_name",
@@ -24,6 +25,27 @@ LEXICAL_FIELDS = (
 )
 
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+QUERY_SYNONYMS = {
+    "врп": ["валовой", "региональный", "продукт"],
+    "ввп": ["валовой", "внутренний", "продукт"],
+    "ниокр": ["исследования", "разработки"],
+    "ипц": ["индекс", "потребительских", "цен"],
+    "торговля": ["внешняя", "экспорт", "импорт", "товаров", "услуг"],
+    "товарооборот": ["торговля", "экспорт", "импорт"],
+}
+QUERY_STOP_TOKENS = {
+    "россия",
+    "россии",
+    "российская",
+    "российской",
+    "федерация",
+    "федерации",
+    "казахстан",
+    "казахстана",
+    "сша",
+    "мир",
+    "мира",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,7 +171,13 @@ def build_bm25_index(
 
 def tokenize_query(query: str) -> list[str]:
     tokens = TOKEN_RE.findall(normalize_text(query).lower())
-    return list(dict.fromkeys(tokens))
+    expanded: list[str] = []
+    for token in tokens:
+        if token.isdigit() or token in QUERY_STOP_TOKENS:
+            continue
+        expanded.append(token)
+        expanded.extend(QUERY_SYNONYMS.get(token, []))
+    return list(dict.fromkeys(expanded))
 
 
 def bm25_query(query: str) -> str:
@@ -165,8 +193,11 @@ def search_bm25(
     match_query = bm25_query(query)
     if not match_query:
         return []
+    resolved_index_path = resolve_path(index_path)
+    if not resolved_index_path.exists():
+        return []
 
-    with sqlite3.connect(resolve_path(index_path)) as connection:
+    with sqlite3.connect(resolved_index_path) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """

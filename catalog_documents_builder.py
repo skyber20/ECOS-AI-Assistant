@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from catalog_builder import ROOT, clean_text, relative
+from catalog_builder import CATALOG_DOCUMENTS_PATH, CATALOG_RECORDS_PATH, ROOT, clean_text, relative
 
 
 SEARCH_TEXT_FIELDS = (
@@ -40,8 +40,8 @@ DOCUMENT_SCHEMA = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build metadata-only catalog search documents.")
-    parser.add_argument("--input", default="data/catalog_records.jsonl")
-    parser.add_argument("--output", default="data/catalog_documents.jsonl")
+    parser.add_argument("--input", default=str(CATALOG_RECORDS_PATH))
+    parser.add_argument("--output", default=str(CATALOG_DOCUMENTS_PATH))
     return parser.parse_args()
 
 
@@ -122,6 +122,7 @@ def build_documents(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def write_jsonl(records: Iterable[dict[str, Any]], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as file:
         for record in records:
             file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
