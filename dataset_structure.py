@@ -226,8 +226,15 @@ def _indicator_columns(
     columns: list[DatasetColumn] = []
     specs_by_name = {spec.name.lower(): spec for spec in intent.indicator_specs}
     names = list(dict.fromkeys([*intent.indicators, *[measurement.name for measurement in design.required_measurements]]))
+    seen_indicator_keys: set[str] = set()
 
     for index, name in enumerate(names, start=1):
+        if _is_non_indicator_name(name):
+            continue
+        indicator_key = _indicator_identity(name)
+        if indicator_key in seen_indicator_keys:
+            continue
+        seen_indicator_keys.add(indicator_key)
         spec = specs_by_name.get(name.lower())
         measurement = _find_measurement(design, name)
         role = measurement.role if measurement else (spec.role if spec and spec.role else "primary")
@@ -251,6 +258,58 @@ def _indicator_columns(
         )
 
     return columns
+
+
+NON_INDICATOR_NAMES = {
+    "country",
+    "country_code",
+    "country_name",
+    "countryiso3code",
+    "geo",
+    "geography",
+    "region",
+    "source",
+    "source_name",
+    "source_url",
+    "dataset",
+    "dataset_id",
+    "data_extracted_at",
+    "downloaded_at",
+    "last_updated",
+    "updated_at",
+    "year",
+    "date",
+    "period",
+}
+
+
+def _is_non_indicator_name(name: str) -> bool:
+    normalized = _normalized_column_key(name)
+    return (
+        normalized in NON_INDICATOR_NAMES
+        or re.fullmatch(r"year_\d+", normalized) is not None
+        or re.fullmatch(r"source_.+", normalized) is not None
+    )
+
+
+def _indicator_identity(name: str) -> str:
+    normalized = _normalized_column_key(name)
+    compact = normalized.replace("_", "")
+    if any(token in normalized for token in ("инфляц", "ипц", "inflation", "cpi")):
+        return "inflation"
+    if any(token in normalized for token in ("ввп", "gdp")) or "валовой_внутренний_продукт" in normalized:
+        return "gdp"
+    if any(token in normalized for token in ("врп", "grp")) or "валовой_региональный_продукт" in normalized:
+        return "grp"
+    return compact or normalized
+
+
+def _normalized_column_key(value: str | None) -> str:
+    if not value:
+        return ""
+    text = value.strip().lower().replace("ё", "е")
+    text = re.sub(r"[^0-9a-zа-я]+", "_", text)
+    return re.sub(r"_+", "_", text).strip("_")
 
 
 def _derived_metric_columns(

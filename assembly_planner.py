@@ -289,13 +289,30 @@ def _heuristic_select_candidates(
 
 def _candidate_bonus(intent: ResearchIntent, candidate: dict[str, Any]) -> int:
     title = str(candidate.get("title") or "").lower()
+    alias_group = str(candidate.get("alias_group") or "").lower()
+    source = str(candidate.get("source") or "").lower()
     bonus = 0
     for indicator in intent.indicators:
         indicator_lower = indicator.lower()
         if indicator_lower == "врп" and "валовой региональный продукт" in title:
             bonus += 8
-        if indicator_lower == "ввп" and "валовой внутренний продукт" in title:
+        if indicator_lower == "ввп" and (
+            "валовой внутренний продукт" in title
+            or "gdp" in title
+            or "gross domestic product" in title
+            or alias_group == "gdp"
+        ):
             bonus += 8
+        if indicator_lower in {"ипц", "инфляция", "инфляции"} and (
+            "индекс потребительских цен" in title
+            or "inflation" in title
+            or "consumer price" in title
+            or "cpi" in title
+            or alias_group == "inflation"
+        ):
+            bonus += 8
+    if _is_cross_country_intent(intent) and source == "world_bank" and alias_group:
+        bonus += 10
     if "оквэд 2" in title or "оквэд2" in title:
         bonus += 2
     return bonus
@@ -313,6 +330,12 @@ def _candidate_penalty(intent: ResearchIntent, candidate: dict[str, Any]) -> int
         penalty += 4
     if "доля" in title and "доля" not in query:
         penalty += 4
+    if any(indicator.lower() == "ввп" for indicator in intent.indicators):
+        if "% of gdp" in title or "percent of gdp" in title:
+            penalty += 6
+    if _is_cross_country_intent(intent) and str(candidate.get("source") or "").lower() == "fedstat":
+        if any(indicator.lower() in {"ввп", "ипц", "инфляция", "инфляции"} for indicator in intent.indicators):
+            penalty += 6
     if intent.time_range and intent.time_range.end_year and intent.time_range.end_year > 2016:
         if "оквэд-2007" in title or "оквэд 2007" in title:
             penalty += 2
@@ -497,7 +520,15 @@ def _build_registry_query(intent: ResearchIntent, design: ResearchStudyDesign) -
 
 
 def _query_tokens(intent: ResearchIntent, design: ResearchStudyDesign) -> set[str]:
-    return _tokens(_build_registry_query(intent, design))
+    query = _build_registry_query(intent, design)
+    tokens = _tokens(query)
+    try:
+        from catalog_bm25_indexer import tokenize_query
+
+        tokens.update(tokenize_query(query))
+    except Exception:
+        pass
+    return tokens
 
 
 def _candidate_text(candidate: dict[str, Any]) -> str:
@@ -530,6 +561,18 @@ def _tokens(text: str) -> set[str]:
         for token in TOKEN_RE.findall(text)
         if len(token) > 2
     }
+
+
+def _is_cross_country_intent(intent: ResearchIntent) -> bool:
+    normalized_geography = {
+        item.lower().replace("ё", "е")
+        for item in intent.geography
+        if item and item.strip()
+    }
+    if len(normalized_geography) > 1:
+        return True
+    query = intent.original_query.lower().replace("ё", "е")
+    return any(marker in query for marker in ("сша", "usa", "united states", "страны", "countries", "брикс", "ес"))
 
 
 def _candidate_limitations(candidate: dict[str, Any]) -> list[str]:

@@ -27,11 +27,22 @@ LEXICAL_FIELDS = (
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 QUERY_SYNONYMS = {
     "врп": ["валовой", "региональный", "продукт"],
-    "ввп": ["валовой", "внутренний", "продукт"],
+    "ввп": ["валовой", "внутренний", "продукт", "gdp", "gross", "domestic", "product"],
+    "инфляция": ["inflation", "consumer", "prices", "annual", "cpi", "индекс", "потребительских", "цен"],
+    "инфляции": ["inflation", "consumer", "prices", "annual", "cpi", "индекс", "потребительских", "цен"],
+    "инфляцию": ["inflation", "consumer", "prices", "annual", "cpi", "индекс", "потребительских", "цен"],
     "ниокр": ["исследования", "разработки"],
-    "ипц": ["индекс", "потребительских", "цен"],
+    "ипц": ["индекс", "потребительских", "цен", "inflation", "consumer", "prices", "cpi"],
     "торговля": ["внешняя", "экспорт", "импорт", "товаров", "услуг"],
     "товарооборот": ["торговля", "экспорт", "импорт"],
+    "всемирный": ["world", "bank", "world_bank", "wb_wdi"],
+    "мировой": ["world", "bank", "world_bank", "wb_wdi"],
+    "ворлд": ["world", "bank", "world_bank", "wb_wdi"],
+    "world": ["bank", "world_bank", "wb_wdi"],
+    "wb": ["world", "bank", "world_bank", "wb_wdi"],
+    "wdi": ["world", "bank", "world_bank", "wb_wdi"],
+    "росстат": ["fedstat"],
+    "емисс": ["fedstat"],
 }
 QUERY_STOP_TOKENS = {
     "россия",

@@ -1,3 +1,4 @@
+import csv
 import json
 import subprocess
 import sys
@@ -6,10 +7,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import assembly_planner
+import hybrid_candidate_retriever
 from artifact_writer import write_orchestration_artifacts
 from assembly_planner import plan_dataset_build
 from catalog_bm25_indexer import tokenize_query
-from dataset_structure import build_target_dataset_structure
+from dataset_structure import DatasetColumn, TargetDatasetStructure, build_target_dataset_structure
 from hybrid_candidate_retriever import retrieve_candidate_datasets
 from parser.intent_parser import (
     Complexity,
@@ -264,12 +267,279 @@ class DatasetPipelineTest(unittest.TestCase):
             self.assertIn(2024, metadata["coverage"]["missing_years"])
             self.assertIn("11000000000 Архангельская область,2020,10.0", rows[1])
 
+    def test_generated_script_does_not_fill_dimension_like_columns_with_indicator_value(self) -> None:
+        structure = TargetDatasetStructure(
+            row_grain="страна-год",
+            primary_key=["geo", "year"],
+            columns=[
+                DatasetColumn(
+                    name="geo",
+                    title="География",
+                    role="dimension",
+                    dtype="string",
+                    nullable=False,
+                ),
+                DatasetColumn(
+                    name="year",
+                    title="Год",
+                    role="dimension",
+                    dtype="integer",
+                    nullable=False,
+                ),
+                DatasetColumn(
+                    name="inflation_rate",
+                    title="inflation_rate",
+                    role="indicator",
+                    dtype="number",
+                    source_field="inflation_rate",
+                ),
+                DatasetColumn(
+                    name="country_code",
+                    title="country_code",
+                    role="indicator",
+                    dtype="string",
+                    source_field="country_code",
+                ),
+                DatasetColumn(
+                    name="year_2",
+                    title="year",
+                    role="indicator",
+                    dtype="integer",
+                    source_field="year",
+                ),
+            ],
+            expected_frequency="годовая",
+            time_range="2020",
+            geography=["Россия"],
+        )
+        plan = plan_dataset_build(sample_intent(), sample_design(sample_intent()), structure, use_registry=False)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            source_path = tmpdir_path / "wb_inflation.json"
+            source_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "country_name": "Russian Federation",
+                            "countryiso3code": "RUS",
+                            "date": 2020,
+                            "value": 3.4,
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            plan.predecessor_datasets[0].data_path = str(source_path)
+            script = generate_build_script(structure, plan)
+            script_path = tmpdir_path / script.filename
+            output_dir = tmpdir_path / "out"
+            script_path.write_text(script.content, encoding="utf-8")
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(script_path),
+                    "--output-dir",
+                    str(output_dir),
+                    "--project-root",
+                    str(Path.cwd()),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            with (output_dir / "target_dataset.csv").open(encoding="utf-8") as file:
+                row = next(csv.DictReader(file))
+
+            self.assertEqual(row["inflation_rate"], "3.4")
+            self.assertEqual(row["country_code"], "RUS")
+            self.assertEqual(row["year_2"], "2020")
+
+    def test_structure_filters_dimension_like_indicator_names(self) -> None:
+        intent = sample_intent().model_copy(
+            update={
+                "indicators": ["Инфляция (ИПЦ)", "inflation_rate", "country_code", "year"],
+                "indicator_specs": [
+                    IndicatorSpec(
+                        name="Инфляция (ИПЦ)",
+                        definition="Годовая инфляция по ИПЦ.",
+                        unit="%",
+                        role="primary",
+                    ),
+                    IndicatorSpec(
+                        name="inflation_rate",
+                        definition="Annual CPI inflation.",
+                        unit="%",
+                        role="primary",
+                    ),
+                ],
+                "granularity": "страна-год",
+                "geography": ["Россия", "США"],
+            }
+        )
+        design = ResearchStudyDesign.model_validate(
+            {
+                "original_query": intent.original_query,
+                "design_summary": "Сравнить инфляцию.",
+                "hypotheses": [],
+                "required_measurements": [
+                    {
+                        "name": "inflation_rate",
+                        "definition": "Annual CPI inflation.",
+                        "unit": "%",
+                        "role": "primary",
+                        "source_candidates": ["World Bank"],
+                        "is_critical": True,
+                    },
+                    {
+                        "name": "country_code",
+                        "definition": "ISO country code.",
+                        "unit": "string",
+                        "role": "primary",
+                        "source_candidates": ["World Bank"],
+                        "is_critical": False,
+                    },
+                    {
+                        "name": "year",
+                        "definition": "Observation year.",
+                        "unit": "integer",
+                        "role": "primary",
+                        "source_candidates": ["World Bank"],
+                        "is_critical": False,
+                    },
+                ],
+                "grouping_rules": [],
+                "derived_metrics": [],
+                "statistical_methods": [],
+                "visualizations": [],
+                "data_quality_checks": [],
+                "methodology_notes": "",
+                "required_row_grain": ["страна-год"],
+                "can_continue": True,
+                "blocking_reasons": [],
+            }
+        )
+
+        structure = build_target_dataset_structure(intent, design)
+        indicator_columns = [column.name for column in structure.columns if column.role == "indicator"]
+
+        self.assertEqual(indicator_columns, ["inflyatsiya_ipts"])
+        self.assertNotIn("country_code", indicator_columns)
+        self.assertNotIn("year_2", indicator_columns)
+
     def test_bm25_query_expands_domain_abbreviations_and_drops_years(self) -> None:
         tokens = tokenize_query("ВРП Архангельской области 2015 2024")
 
         self.assertIn("валовой", tokens)
         self.assertIn("региональный", tokens)
         self.assertNotIn("2015", tokens)
+
+    def test_query_expansion_adds_world_bank_indicator_aliases(self) -> None:
+        gdp_tokens = tokenize_query("ВВП США Россия 2020 2024")
+        inflation_tokens = tokenize_query("ИПЦ США Россия")
+
+        self.assertIn("gdp", gdp_tokens)
+        self.assertIn("gross", gdp_tokens)
+        self.assertIn("consumer", inflation_tokens)
+        self.assertIn("cpi", inflation_tokens)
+
+    def test_hybrid_ranking_keeps_canonical_wb_gdp_first(self) -> None:
+        records = {
+            "wb:NY.GDP.MKTP.CD": {
+                "record_id": "wb:NY.GDP.MKTP.CD",
+                "title": "GDP (current US$)",
+                "source": "world_bank",
+            },
+            "wb:DP.DOD.DECD.CR.FC.Z1": {
+                "record_id": "wb:DP.DOD.DECD.CR.FC.Z1",
+                "title": (
+                    "Gross PSD, Financial Public Corp., Domestic creditors, "
+                    "Nominal Value, % of GDP"
+                ),
+                "source": "world_bank",
+            },
+            "fedstat:30946": {
+                "record_id": "fedstat:30946",
+                "title": "Валовой внутренний продукт в рыночных ценах",
+                "source": "fedstat",
+            },
+        }
+
+        with patch("hybrid_candidate_retriever._catalog_records", return_value=records):
+            candidates = hybrid_candidate_retriever._merge_candidates(
+                query="ВВП США Россия",
+                alias_results=[{**records["wb:NY.GDP.MKTP.CD"], "alias_rank": 1}],
+                vector_results=[
+                    {
+                        **records["wb:DP.DOD.DECD.CR.FC.Z1"],
+                        "vector_rank": 1,
+                        "vector_score": 1.0,
+                    }
+                ],
+                bm25_results=[
+                    {
+                        **records["fedstat:30946"],
+                        "bm25_rank": 1,
+                        "bm25_score": -10.0,
+                    }
+                ],
+            )
+
+        self.assertEqual(candidates[0]["record_id"], "wb:NY.GDP.MKTP.CD")
+        self.assertIn("alias", candidates[0]["matched_by"])
+
+    def test_planner_heuristic_prefers_wb_alias_for_cross_country_gdp(self) -> None:
+        intent = sample_intent().model_copy(
+            update={
+                "original_query": "ВВП США Россия 2020 2024",
+                "topic": "динамика ВВП России и США",
+                "objects": ["Россия", "США"],
+                "geography": ["Россия", "США"],
+                "time_range": TimeRange(
+                    raw="2020-2024",
+                    start_year=2020,
+                    end_year=2024,
+                    is_explicit=True,
+                ),
+                "indicators": ["ВВП"],
+                "indicator_specs": [
+                    IndicatorSpec(
+                        name="ВВП",
+                        definition="валовой внутренний продукт",
+                        unit="US$",
+                        role="primary",
+                    )
+                ],
+            }
+        )
+        design = sample_design(intent)
+        candidates = [
+            {
+                "record_id": "fedstat:30946",
+                "title": "Валовой внутренний продукт в рыночных ценах",
+                "source": "fedstat",
+                "data_path": "dumps/fedstatru/fedstatru/data/parquet/30946.parquet",
+            },
+            {
+                "record_id": "wb:NY.GDP.MKTP.CD",
+                "title": "GDP (current US$)",
+                "source": "world_bank",
+                "data_path": "dumps/wb/wb/parquet/NY.GDP.MKTP.CD.parquet",
+                "alias_group": "gdp",
+            },
+        ]
+
+        selected = assembly_planner._heuristic_select_candidates(
+            intent,
+            design,
+            candidates,
+            limit=1,
+        )
+
+        self.assertEqual(selected[0].record_id, "wb:NY.GDP.MKTP.CD")
 
 
 if __name__ == "__main__":

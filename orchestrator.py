@@ -1,22 +1,28 @@
+import warnings
 from enum import Enum
-from typing import Any
+from typing import Any, TypedDict
 
+from langchain_core._api.deprecation import LangChainPendingDeprecationWarning
+
+warnings.simplefilter("ignore", LangChainPendingDeprecationWarning)
+
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from assembly_planner import DatasetBuildPlan, plan_dataset_build
 from dataset_structure import TargetDatasetStructure, build_target_dataset_structure
+from designer.research_designer import ResearchStudyDesign, design_research
 from parser.intent_parser import (
-    IntentType,
     IntentParserError,
+    IntentType,
     LLMSettings,
     NextAction,
     ResearchIntent,
+    SYSTEM_PROMPT,
     _create_json_completion,
     _parse_intent_json,
     create_llm_settings,
-    parse_research_intent,
 )
-from designer.research_designer import ResearchStudyDesign, design_research
 from script_generator import GeneratedBuildScript, generate_build_script
 
 
@@ -64,6 +70,19 @@ class OrchestrationResult(BaseModel):
         return [] if value is None else value
 
 
+class PipelineState(TypedDict, total=False):
+    query: str
+    intent: ResearchIntent
+    use_defaults: bool
+    use_registry: bool
+    readiness: OrchestrationResult
+    research_design: ResearchStudyDesign
+    dataset_structure: TargetDatasetStructure
+    build_plan: DatasetBuildPlan
+    build_script: GeneratedBuildScript
+    result: OrchestrationResult
+
+
 REFINE_INTENT_PROMPT = """Ты обновляешь JSON первого этапа ResearchIntent после уточнений пользователя.
 
 На входе:
@@ -82,6 +101,184 @@ REFINE_INTENT_PROMPT = """Ты обновляешь JSON первого этап
 """
 
 
+class ResearchPipelineAgent:
+    """Graph agent for the ECOS research-data pipeline."""
+
+    def __init__(
+        self,
+        settings: LLMSettings | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        self.settings = settings
+        self.provider = provider
+        self.model = model
+        self.graph = self._build_graph()
+
+    def run(
+        self,
+        query: str,
+        use_defaults: bool = False,
+        use_registry: bool = True,
+    ) -> OrchestrationResult:
+        if not query.strip():
+            raise ValueError("Query must not be empty.")
+        state = self.graph.invoke(
+            {
+                "query": query,
+                "use_defaults": use_defaults,
+                "use_registry": use_registry,
+            }
+        )
+        return state["result"]
+
+    def continue_from_intent(
+        self,
+        intent: ResearchIntent,
+        use_defaults: bool = False,
+        use_registry: bool = True,
+    ) -> OrchestrationResult:
+        state = self.graph.invoke(
+            {
+                "intent": intent,
+                "use_defaults": use_defaults,
+                "use_registry": use_registry,
+            }
+        )
+        return state["result"]
+
+    def refine_intent(
+        self,
+        intent: ResearchIntent,
+        answers: list[ClarificationAnswer],
+    ) -> ResearchIntent:
+        if not answers:
+            return intent
+        content = _create_json_completion(
+            self._settings(),
+            build_refine_intent_messages(intent, answers),
+        )
+        return _parse_intent_json(content, original_query=intent.original_query)
+
+    def _settings(self) -> LLMSettings:
+        if self.settings is None:
+            self.settings = create_llm_settings(provider=self.provider, model=self.model)
+        return self.settings
+
+    def _build_graph(self):
+        graph = StateGraph(PipelineState)
+        graph.add_node("start", lambda state: state)
+        graph.add_node("parse_intent", self._parse_intent)
+        graph.add_node("validate_intent", self._validate_intent)
+        graph.add_node("design_research", self._design_research)
+        graph.add_node("dataset_structure", self._dataset_structure)
+        graph.add_node("build_plan", self._build_plan)
+        graph.add_node("build_script", self._build_script)
+
+        graph.add_edge(START, "start")
+        graph.add_conditional_edges(
+            "start",
+            lambda state: "validate_intent" if state.get("intent") else "parse_intent",
+            {
+                "parse_intent": "parse_intent",
+                "validate_intent": "validate_intent",
+            },
+        )
+        graph.add_edge("parse_intent", "validate_intent")
+        graph.add_conditional_edges(
+            "validate_intent",
+            self._route_after_validation,
+            {"design_research": "design_research", END: END},
+        )
+        graph.add_conditional_edges(
+            "design_research",
+            lambda state: END if state.get("result") else "dataset_structure",
+            {"dataset_structure": "dataset_structure", END: END},
+        )
+        graph.add_edge("dataset_structure", "build_plan")
+        graph.add_edge("build_plan", "build_script")
+        graph.add_edge("build_script", END)
+        return graph.compile()
+
+    def _parse_intent(self, state: PipelineState) -> PipelineState:
+        content = _create_json_completion(
+            self._settings(),
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": state["query"]},
+            ],
+        )
+        return {"intent": _parse_intent_json(content, original_query=state["query"])}
+
+    def _validate_intent(self, state: PipelineState) -> PipelineState:
+        readiness = prepare_intent_for_design(
+            state["intent"],
+            use_defaults=state.get("use_defaults", False),
+        )
+        if readiness.status != OrchestrationStatus.READY_FOR_DESIGN:
+            return {"readiness": readiness, "result": readiness}
+        return {"readiness": readiness}
+
+    def _route_after_validation(self, state: PipelineState) -> str:
+        return END if state.get("result") else "design_research"
+
+    def _design_research(self, state: PipelineState) -> PipelineState:
+        design = design_research(state["intent"], settings=self._settings())
+        if design.can_continue:
+            return {"research_design": design}
+        return {
+            "research_design": design,
+            "result": OrchestrationResult(
+                status=OrchestrationStatus.DESIGN_READY,
+                intent=state["intent"],
+                clarification_requests=_result_clarifications(state),
+                research_design=design,
+                message="Дизайн исследования построен, но дальнейшая сборка заблокирована.",
+            ),
+        }
+
+    def _dataset_structure(self, state: PipelineState) -> PipelineState:
+        return {
+            "dataset_structure": build_target_dataset_structure(
+                state["intent"],
+                state["research_design"],
+            )
+        }
+
+    def _build_plan(self, state: PipelineState) -> PipelineState:
+        return {
+            "build_plan": plan_dataset_build(
+                intent=state["intent"],
+                design=state["research_design"],
+                structure=state["dataset_structure"],
+                settings=self._settings(),
+                use_registry=state.get("use_registry", True),
+            )
+        }
+
+    def _build_script(self, state: PipelineState) -> PipelineState:
+        script = generate_build_script(
+            state["dataset_structure"],
+            state["build_plan"],
+        )
+        return {
+            "build_script": script,
+            "result": OrchestrationResult(
+                status=OrchestrationStatus.DESIGN_READY,
+                intent=state["intent"],
+                clarification_requests=_result_clarifications(state),
+                research_design=state["research_design"],
+                dataset_structure=state["dataset_structure"],
+                build_plan=state["build_plan"],
+                build_script=script,
+                message="Сформированы дизайн исследования, структура датасета, план сборки и скрипт.",
+            ),
+        }
+
+
+LangGraphResearchAgent = ResearchPipelineAgent
+
+
 def run_research_flow(
     query: str,
     settings: LLMSettings | None = None,
@@ -90,16 +287,8 @@ def run_research_flow(
     use_defaults: bool = False,
     use_registry: bool = True,
 ) -> OrchestrationResult:
-    intent = parse_research_intent(
+    return ResearchPipelineAgent(settings=settings, provider=provider, model=model).run(
         query,
-        provider=provider,
-        model=model,
-    )
-    return continue_research_flow(
-        intent,
-        settings=settings,
-        provider=provider,
-        model=model,
         use_defaults=use_defaults,
         use_registry=use_registry,
     )
@@ -113,46 +302,10 @@ def continue_research_flow(
     use_defaults: bool = False,
     use_registry: bool = True,
 ) -> OrchestrationResult:
-    readiness = prepare_intent_for_design(intent, use_defaults=use_defaults)
-    if readiness.status != OrchestrationStatus.READY_FOR_DESIGN:
-        return readiness
-
-    design = design_research(
+    return ResearchPipelineAgent(settings=settings, provider=provider, model=model).continue_from_intent(
         intent,
-        settings=settings,
-        provider=provider,
-        model=model,
-    )
-    if not design.can_continue:
-        return OrchestrationResult(
-            status=OrchestrationStatus.DESIGN_READY,
-            intent=intent,
-            clarification_requests=[] if use_defaults else readiness.clarification_requests,
-            research_design=design,
-            message="Дизайн исследования построен, но дальнейшая сборка заблокирована.",
-        )
-
-    dataset_structure = build_target_dataset_structure(intent, design)
-    build_plan = plan_dataset_build(
-        intent=intent,
-        design=design,
-        structure=dataset_structure,
-        settings=settings,
-        provider=provider,
-        model=model,
+        use_defaults=use_defaults,
         use_registry=use_registry,
-    )
-    build_script = generate_build_script(dataset_structure, build_plan)
-
-    return OrchestrationResult(
-        status=OrchestrationStatus.DESIGN_READY,
-        intent=intent,
-        clarification_requests=[] if use_defaults else readiness.clarification_requests,
-        research_design=design,
-        dataset_structure=dataset_structure,
-        build_plan=build_plan,
-        build_script=build_script,
-        message="Сформированы дизайн исследования, структура датасета, план сборки и скрипт.",
     )
 
 
@@ -163,15 +316,11 @@ def refine_intent_with_clarifications(
     provider: str | None = None,
     model: str | None = None,
 ) -> ResearchIntent:
-    if not answers:
-        return intent
-
-    llm_settings = settings or create_llm_settings(provider=provider, model=model)
-    messages = build_refine_intent_messages(intent, answers)
-    content = _create_json_completion(llm_settings, messages)
-
     try:
-        return _parse_intent_json(content, original_query=intent.original_query)
+        return ResearchPipelineAgent(settings=settings, provider=provider, model=model).refine_intent(
+            intent,
+            answers,
+        )
     except IntentParserError as exc:
         raise RuntimeError(f"Failed to refine ResearchIntent after clarification: {exc}") from exc
 
@@ -181,10 +330,7 @@ def build_refine_intent_messages(
     answers: list[ClarificationAnswer],
 ) -> list[dict[str, str]]:
     return [
-        {
-            "role": "system",
-            "content": REFINE_INTENT_PROMPT,
-        },
+        {"role": "system", "content": REFINE_INTENT_PROMPT},
         {
             "role": "user",
             "content": (
@@ -207,7 +353,6 @@ def prepare_intent_for_design(
         return OrchestrationResult(
             status=OrchestrationStatus.NO_DATA,
             intent=intent,
-            clarification_requests=[],
             message=intent.data_availability.verdict
             or "Данные недоступны в верифицированных источниках.",
         )
@@ -227,22 +372,19 @@ def prepare_intent_for_design(
             clarification_requests=clarification_requests,
             message="Нужно уточнить недостающие поля перед дизайном исследования.",
         )
-    if clarification_requests and use_defaults:
-        missing_defaults = [
-            request
-            for request in clarification_requests
-            if not request.default_assumption
-        ]
-        if missing_defaults:
-            return OrchestrationResult(
-                status=OrchestrationStatus.NEEDS_CLARIFICATION,
-                intent=intent,
-                clarification_requests=missing_defaults,
-                message=(
-                    "Нужно уточнить поля, для которых нет безопасного default "
-                    "assumption."
-                ),
-            )
+
+    missing_defaults = [
+        request
+        for request in clarification_requests
+        if use_defaults and not request.default_assumption
+    ]
+    if missing_defaults:
+        return OrchestrationResult(
+            status=OrchestrationStatus.NEEDS_CLARIFICATION,
+            intent=intent,
+            clarification_requests=missing_defaults,
+            message="Нужно уточнить поля, для которых нет безопасного default assumption.",
+        )
 
     return OrchestrationResult(
         status=OrchestrationStatus.READY_FOR_DESIGN,
@@ -256,98 +398,60 @@ def validate_intent_for_design(intent: ResearchIntent) -> list[ClarificationRequ
 
     if intent.next_action == NextAction.ASK_CLARIFICATION:
         requests.extend(_requests_from_model_questions(intent))
-
     if not intent.topic:
-        requests.append(
-            ClarificationRequest(
-                field="topic",
-                reason="Не определена тема исследования.",
-                question="Какую тему или явление нужно изучить?",
-                default_assumption=_default_at(intent, 0),
-            )
-        )
-
+        requests.append(_request(intent, "topic", "Не определена тема исследования.", "Какую тему или явление нужно изучить?"))
     if _requires_geography(intent) and not intent.geography:
-        requests.append(
-            ClarificationRequest(
-                field="geography",
-                reason="Не указана страна, регион или группа объектов.",
-                question="Какая страна, регион или группа объектов вас интересует?",
-                default_assumption=_default_containing(intent, ["географ", "страна", "регион"]),
-            )
-        )
-
+        requests.append(_request(intent, "geography", "Не указана страна, регион или группа объектов.", "Какая страна, регион или группа объектов вас интересует?"))
     if _requires_time(intent) and _is_missing_time(intent):
-        requests.append(
-            ClarificationRequest(
-                field="time_range",
-                reason="Не указан временной период.",
-                question="За какой период нужны данные или исследование?",
-                default_assumption=_default_containing(intent, ["период", "последн", "год"]),
-            )
-        )
-
+        requests.append(_request(intent, "time_range", "Не указан временной период.", "За какой период нужны данные или исследование?"))
     if not intent.indicators and not intent.indicator_specs:
-        requests.append(
-            ClarificationRequest(
-                field="indicators",
-                reason="Не определены показатели для анализа.",
-                question="Какие показатели или метрики нужно использовать?",
-                default_assumption=_default_containing(intent, ["показател", "метрик"]),
-            )
-        )
-
+        requests.append(_request(intent, "indicators", "Не определены показатели для анализа.", "Какие показатели или метрики нужно использовать?"))
     if _requires_indicator_methodology(intent):
-        requests.append(
-            ClarificationRequest(
-                field="indicator_specs",
-                reason="Для одного или нескольких показателей не хватает определения или единицы измерения.",
-                question="Какую методику и единицы измерения использовать для ключевых показателей?",
-                default_assumption=_default_containing(intent, ["метод", "единиц", "ипц", "%"]),
-            )
-        )
-
+        requests.append(_request(intent, "indicator_specs", "Для одного или нескольких показателей не хватает определения или единицы измерения.", "Какую методику и единицы измерения использовать для ключевых показателей?"))
     if _requires_frequency(intent) and not intent.frequency:
-        requests.append(
-            ClarificationRequest(
-                field="frequency",
-                reason="Не указана частота наблюдений.",
-                question="Какая частота данных нужна: годовая, квартальная или месячная?",
-                default_assumption=_default_containing(intent, ["частот", "годовая", "месячная"]),
-            )
-        )
-
+        requests.append(_request(intent, "frequency", "Не указана частота наблюдений.", "Какая частота данных нужна: годовая, квартальная или месячная?"))
     if _requires_dataset_spec(intent) and _has_incomplete_dataset_spec(intent):
-        requests.append(
-            ClarificationRequest(
-                field="dataset_spec",
-                reason="Не полностью определена структура целевого датасета.",
-                question="Какую зернистость строк и ключевые столбцы ожидаете в итоговом датасете?",
-                default_assumption=_default_containing(intent, ["зернист", "строк", "датасет"]),
-            )
-        )
-
+        requests.append(_request(intent, "dataset_spec", "Не полностью определена структура целевого датасета.", "Какую зернистость строк и ключевые столбцы ожидаете в итоговом датасете?"))
     if intent.intent_type == IntentType.RESEARCH and not intent.research_questions:
-        requests.append(
-            ClarificationRequest(
-                field="research_questions",
-                reason="Для исследовательской задачи не сформулированы исследовательские вопросы.",
-                question="Какие исследовательские вопросы нужно проверить?",
-                default_assumption=_default_containing(intent, ["вопрос", "связ", "зависим"]),
-            )
-        )
-
+        requests.append(_request(intent, "research_questions", "Для исследовательской задачи не сформулированы исследовательские вопросы.", "Какие исследовательские вопросы нужно проверить?"))
     if intent.intent_type == IntentType.DERIVED and not intent.derived_metrics:
-        requests.append(
-            ClarificationRequest(
-                field="derived_metrics",
-                reason="Запрос требует производную метрику, но формула не определена.",
-                question="Какую формулу или базу нормализации использовать для производной метрики?",
-                default_assumption=_default_containing(intent, ["формул", "баз", "нормал"]),
-            )
-        )
+        requests.append(_request(intent, "derived_metrics", "Запрос требует производную метрику, но формула не определена.", "Какую формулу или базу нормализации использовать для производной метрики?"))
 
     return _deduplicate_requests(requests)
+
+
+FIELD_DEFAULT_TOKENS = {
+    "topic": [],
+    "geography": ["географ", "страна", "регион"],
+    "time_range": ["период", "диапазон", "последн", "год"],
+    "frequency": ["частот", "годовая", "месячная", "квартальная"],
+    "indicators": ["показател", "метрик", "ипц", "инфляц"],
+    "indicator_specs": ["метод", "методик", "единиц", "ипц", "%"],
+    "methodology": ["метод", "методик", "декабрь", "базов"],
+    "dataset_spec": ["зернист", "строк", "датасет", "колон"],
+    "research_questions": ["вопрос", "связ", "зависим"],
+    "derived_metrics": ["формул", "баз", "нормал"],
+}
+
+
+def _result_clarifications(state: PipelineState) -> list[ClarificationRequest]:
+    if state.get("use_defaults"):
+        return []
+    return state["readiness"].clarification_requests
+
+
+def _request(
+    intent: ResearchIntent,
+    field: str,
+    reason: str,
+    question: str,
+) -> ClarificationRequest:
+    return ClarificationRequest(
+        field=field,
+        reason=reason,
+        question=question,
+        default_assumption=_default_for_field(intent, field),
+    )
 
 
 def _answers_to_json(answers: list[ClarificationAnswer]) -> str:
@@ -357,14 +461,10 @@ def _answers_to_json(answers: list[ClarificationAnswer]) -> str:
 
 
 def _requests_from_model_questions(intent: ResearchIntent) -> list[ClarificationRequest]:
-    requests = []
     ambiguities = intent.ambiguities or ["Запрос требует уточнения."]
-
+    requests = []
     for index, question in enumerate(intent.clarifying_questions):
-        field = _guess_field(
-            question,
-            ambiguities[index] if index < len(ambiguities) else "",
-        )
+        field = _guess_field(question, ambiguities[index] if index < len(ambiguities) else "")
         requests.append(
             ClarificationRequest(
                 field=field,
@@ -373,7 +473,6 @@ def _requests_from_model_questions(intent: ResearchIntent) -> list[Clarification
                 default_assumption=_default_for_field(intent, field) or _default_at(intent, index),
             )
         )
-
     return requests
 
 
@@ -414,7 +513,6 @@ def _requires_dataset_spec(intent: ResearchIntent) -> bool:
 def _has_incomplete_dataset_spec(intent: ResearchIntent) -> bool:
     if intent.dataset_spec is None:
         return True
-
     has_row_grain = bool(intent.dataset_spec.row_grain or intent.granularity)
     has_columns = bool(intent.dataset_spec.columns)
     has_frequency = bool(intent.dataset_spec.frequency or intent.frequency)
@@ -423,8 +521,6 @@ def _has_incomplete_dataset_spec(intent: ResearchIntent) -> bool:
 
 def _requires_indicator_methodology(intent: ResearchIntent) -> bool:
     if intent.intent_type in {IntentType.NO_DATA, IntentType.UNSUPPORTED}:
-        return False
-    if not intent.indicator_specs:
         return False
     return any(not spec.definition or not spec.unit for spec in intent.indicator_specs)
 
@@ -441,17 +537,17 @@ def _is_missing_time(intent: ResearchIntent) -> bool:
 
 def _guess_field(question: str, reason: str) -> str:
     text = f"{question} {reason}".lower()
-    if any(token in text for token in ["частота", "месяч", "квартал", "годовая"]):
-        return "frequency"
-    if any(token in text for token in ["метод", "методик", "формул"]):
-        return "methodology"
-    if any(token in text for token in ["страна", "регион", "географ", "территор"]):
-        return "geography"
-    if any(token in text for token in ["период", "год", "время", "диапазон"]):
-        return "time_range"
-    if any(token in text for token in ["показател", "метрик", "ипц", "инфляц"]):
-        return "indicators"
-    return "other"
+    field_markers = {
+        "frequency": ["частота", "месяч", "квартал", "годовая"],
+        "methodology": ["метод", "методик", "формул"],
+        "geography": ["страна", "регион", "географ", "территор"],
+        "time_range": ["период", "год", "время", "диапазон"],
+        "indicators": ["показател", "метрик", "ипц", "инфляц"],
+    }
+    return next(
+        (field for field, markers in field_markers.items() if any(marker in text for marker in markers)),
+        "other",
+    )
 
 
 def _default_at(intent: ResearchIntent, index: int) -> str | None:
@@ -460,7 +556,8 @@ def _default_at(intent: ResearchIntent, index: int) -> str | None:
     return None
 
 
-def _default_containing(intent: ResearchIntent, tokens: list[str]) -> str | None:
+def _default_for_field(intent: ResearchIntent, field: str) -> str | None:
+    tokens = FIELD_DEFAULT_TOKENS.get(field, [])
     for assumption in intent.assumptions_if_no_answer:
         lower = assumption.lower()
         if any(token in lower for token in tokens):
@@ -468,29 +565,13 @@ def _default_containing(intent: ResearchIntent, tokens: list[str]) -> str | None
     return None
 
 
-def _default_for_field(intent: ResearchIntent, field: str) -> str | None:
-    field_tokens = {
-        "geography": ["географ", "страна", "регион"],
-        "time_range": ["период", "диапазон", "последн"],
-        "frequency": ["частот", "годовая", "месячная", "квартальная"],
-        "indicators": ["показател", "метрик", "ипц", "инфляц"],
-        "methodology": ["метод", "методик", "декабрь", "базов"],
-        "dataset_spec": ["зернист", "строк", "датасет", "колон"],
-        "derived_metrics": ["формул", "баз", "нормал"],
-    }
-    return _default_containing(intent, field_tokens.get(field, []))
-
-
 def _deduplicate_requests(
     requests: list[ClarificationRequest],
 ) -> list[ClarificationRequest]:
     result: list[ClarificationRequest] = []
     seen_fields: set[str] = set()
-
     for request in requests:
-        if request.field in seen_fields:
-            continue
-        seen_fields.add(request.field)
-        result.append(request)
-
+        if request.field not in seen_fields:
+            seen_fields.add(request.field)
+            result.append(request)
     return result

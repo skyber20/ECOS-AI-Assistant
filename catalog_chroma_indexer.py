@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +17,7 @@ from catalog_builder import (
 
 
 COLLECTION_NAME = "catalog_documents"
-EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
+EMBEDDING_MODEL = os.getenv("CATALOG_EMBEDDING_MODEL", "local-hash")
 TEXT_INSTRUCTION = "passage: "
 QUERY_INSTRUCTION = "query: "
 BATCH_SIZE = 512
@@ -145,6 +146,14 @@ def index_documents(
     embedding_model_name: str,
     batch_size: int,
 ) -> int:
+    if embedding_model_name == "local-hash":
+        return index_documents_with_local_hash(
+            documents=documents,
+            persist_dir=persist_dir,
+            collection_name=collection_name,
+            batch_size=batch_size,
+        )
+
     import chromadb
     from llama_index.core import Settings, StorageContext, VectorStoreIndex
     from llama_index.embeddings.huggingface import HuggingFaceEmbedding
@@ -183,6 +192,32 @@ def index_documents(
         insert_batch_size=batch_size,
         show_progress=True,
     )
+    return collection.count()
+
+
+def index_documents_with_local_hash(
+    documents: list[CatalogIndexDocument],
+    persist_dir: Path,
+    collection_name: str,
+    batch_size: int,
+) -> int:
+    import chromadb
+
+    from catalog_local_embeddings import embed_texts
+
+    reset_persist_dir(persist_dir)
+    collection = chromadb.PersistentClient(path=str(persist_dir)).create_collection(
+        collection_name
+    )
+    for start in range(0, len(documents), batch_size):
+        batch = documents[start:start + batch_size]
+        texts = [f"{TEXT_INSTRUCTION}{document.text}" for document in batch]
+        collection.add(
+            ids=[document.doc_id for document in batch],
+            documents=[document.text for document in batch],
+            metadatas=[document.metadata for document in batch],
+            embeddings=embed_texts(texts),
+        )
     return collection.count()
 
 

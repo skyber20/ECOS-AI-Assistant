@@ -165,6 +165,103 @@ def _render_script(
             return value
 
 
+        FIELD_ALIASES = {{
+            "country_code": ("country_code", "countryiso3code", "iso3", "iso_code", "country_id"),
+            "year": ("year", "date", "год"),
+            "geo": (
+                "geo",
+                "country_name",
+                "country",
+                "region",
+                "territory",
+                "Классификатор объектов административно-территориального деления (ОКАТО)",
+            ),
+        }}
+
+
+        def normalize_field_name(value):
+            text = str(value or "").strip().lower().replace("ё", "е")
+            text = re.sub(r"[^0-9a-zа-я]+", "_", text)
+            return re.sub(r"_+", "_", text).strip("_")
+
+
+        def field_value(source_row, *field_names):
+            lookup = dict(
+                (normalize_field_name(key), value)
+                for key, value in source_row.items()
+            )
+            for field_name in field_names:
+                if not field_name:
+                    continue
+                if field_name in source_row:
+                    value = source_row[field_name]
+                    if value is not None and str(value).strip() != "":
+                        return value
+                normalized = normalize_field_name(field_name)
+                if normalized in lookup:
+                    value = lookup[normalized]
+                    if value is not None and str(value).strip() != "":
+                        return value
+                for alias in FIELD_ALIASES.get(normalized, ()):
+                    if alias in source_row:
+                        value = source_row[alias]
+                        if value is not None and str(value).strip() != "":
+                            return value
+                    alias_normalized = normalize_field_name(alias)
+                    if alias_normalized in lookup:
+                        value = lookup[alias_normalized]
+                        if value is not None and str(value).strip() != "":
+                            return value
+            return None
+
+
+        def column_identity_values(column):
+            return [
+                normalize_field_name(column.get(key))
+                for key in ("name", "title", "source_field")
+                if column.get(key)
+            ]
+
+
+        def matches_base_name(value, base):
+            return value == base or re.fullmatch(base + r"_\\d+", value or "") is not None
+
+
+        def is_year_column(column):
+            return any(
+                matches_base_name(value, "year") or value in ("год", "god", "date")
+                for value in column_identity_values(column)
+            )
+
+
+        def is_country_code_column(column):
+            return any(
+                matches_base_name(value, "country_code")
+                or value in ("countryiso3code", "iso3", "iso_code", "country_id", "kod_strany")
+                for value in column_identity_values(column)
+            )
+
+
+        def is_metadata_like_column(column):
+            prefixes = (
+                "source",
+                "downloaded",
+                "updated",
+                "last_updated",
+                "data_extracted",
+                "dataset",
+            )
+            return any(value.startswith(prefixes) for value in column_identity_values(column))
+
+
+        def can_use_generic_value(column):
+            if column.get("role") not in ("indicator", "derived_metric"):
+                return False
+            if is_year_column(column) or is_country_code_column(column) or is_metadata_like_column(column):
+                return False
+            return True
+
+
         def column_sort_key(name):
             match = re.search(r"\\d+", str(name))
             return int(match.group(0)) if match else 10_000
@@ -338,9 +435,13 @@ def _render_script(
             name = column["name"]
             role = column.get("role")
             source_field = column.get("source_field")
-            direct_value = source_row.get(name)
+            direct_value = field_value(source_row, name)
             if direct_value is not None:
                 return direct_value
+            if is_year_column(column):
+                return row_year(source_row)
+            if is_country_code_column(column):
+                return field_value(source_row, "country_code")
             if source_field and source_field in source_row:
                 return source_row[source_field]
             if name == "geo":
@@ -353,7 +454,11 @@ def _render_script(
                 ))
             if name == "year":
                 return row_year(source_row)
-            if role in ("indicator", "derived_metric"):
+            if source_field:
+                source_value = field_value(source_row, source_field)
+                if source_value is not None:
+                    return source_value
+            if can_use_generic_value(column):
                 return first_non_empty(source_row.get("value"), source_row.get("Value"), source_row.get("VALUE"))
             return None
 
