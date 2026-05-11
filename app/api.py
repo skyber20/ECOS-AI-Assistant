@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from artifact_writer import WrittenArtifact, write_orchestration_artifacts
 from dataset_reranker import DatasetRerankerError
+from hybrid_candidate_retriever import vector_search_status
 from intent_parser import IntentParserError, ResearchIntent
 from orchestrator import (
     ClarificationAnswer,
@@ -128,6 +129,7 @@ def create_app() -> FastAPI:
             "catalog_records_exists": Path("data/catalog_records.jsonl").exists(),
             "catalog_bm25_exists": Path("data/catalog_bm25.sqlite").exists(),
             "dumps_exists": Path("dumps").exists(),
+            "vector_search": vector_search_status(),
         }
 
     @app.post("/api/research", response_model=ResearchRunResponse)

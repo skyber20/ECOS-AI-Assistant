@@ -446,6 +446,7 @@ def _chart_from_dataset(
         structure,
         spec.get("y_axis"),
         preferred_roles=["indicator", "derived_metric"],
+        allow_numeric_fallback=not bool(spec.get("y_axis")),
     )
     color_column = _resolve_column(
         dataframe,
@@ -528,6 +529,7 @@ def _resolve_column(
     requested: Any,
     preferred_roles: list[str] | None = None,
     fallback_names: list[str] | None = None,
+    allow_numeric_fallback: bool = True,
 ) -> str | None:
     columns = list(dataframe.columns)
     candidates: list[Any] = [requested]
@@ -548,6 +550,9 @@ def _resolve_column(
                 column = _match_column(columns, item.get("name")) or _match_column(columns, item.get("title"))
                 if column:
                     return column
+
+    if not allow_numeric_fallback:
+        return None
 
     numeric_columns = []
     dimension_keys = {"year", "date", "period", "time", "geo", "country", "region"}

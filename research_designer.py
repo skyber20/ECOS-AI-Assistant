@@ -196,6 +196,7 @@ ResearchIntent - главный контракт для дизайна иссл�
 - Для derived обязательно перенеси или уточни формулы из intent. Формула должна быть проверяемой и гарантировать заявленную базу/нормализацию.
 - required_measurements должны покрывать primary indicators, controls, grouping dimensions и inputs производных метрик.
 - visualizations должны быть конкретными: тип графика, оси, метрики, как читать.
+- Не создавай несколько visualizations с одинаковыми chart_type, x_axis, y_axis, grouping и metrics_used; каждая визуализация должна отвечать на отдельный вопрос или гипотезу.
 - Используй русский язык в текстовых полях.
 """
 
@@ -275,4 +276,28 @@ def _apply_design_corrections(
     elif intent.granularity and not design.required_row_grain:
         design.required_row_grain = [intent.granularity]
 
+    design.visualizations = _dedupe_visualizations(design.visualizations)
+
     return design
+
+
+def _dedupe_visualizations(visualizations: list[VisualizationSpec]) -> list[VisualizationSpec]:
+    result: list[VisualizationSpec] = []
+    seen: set[tuple[str, str, str, str, tuple[str, ...]]] = set()
+    for item in visualizations:
+        key = (
+            _normalize_design_key(item.chart_type),
+            _normalize_design_key(item.x_axis),
+            _normalize_design_key(item.y_axis),
+            _normalize_design_key(item.grouping),
+            tuple(_normalize_design_key(value) for value in item.metrics_used),
+        )
+        if key in seen:
+            continue
+        result.append(item)
+        seen.add(key)
+    return result
+
+
+def _normalize_design_key(value: Any) -> str:
+    return " ".join(str(value or "").lower().split())

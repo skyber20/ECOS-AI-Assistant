@@ -1,6 +1,7 @@
 import json
 import os
 from functools import lru_cache
+from importlib.util import find_spec
 from typing import Any, Iterable
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -39,6 +40,10 @@ CANDIDATE_FIELDS = (
     "source_name",
     "is_invalid",
 )
+EMBEDDING_LOCAL_ONLY_ENV = "ECOS_EMBEDDING_LOCAL_ONLY"
+VECTOR_STRICT_ENV = "ECOS_REQUIRE_VECTOR_SEARCH"
+
+_VECTOR_LAST_ERROR: str | None = None
 
 
 def retrieve_candidate_datasets(
@@ -58,12 +63,19 @@ def retrieve_candidate_datasets(
 def _retrieval_queries(user_query: str | ResearchIntent) -> tuple[list[str], list[str]]:
     if isinstance(user_query, ResearchIntent):
         original_query = _clean_query(user_query.original_query)
-        vector_queries = _dedupe_queries([original_query, user_query.english_query])
+        keyword_queries = _keyword_synonym_queries(user_query)
+        vector_queries = _dedupe_queries(
+            [
+                user_query.english_query,
+                *keyword_queries,
+                original_query,
+            ]
+        )
         bm25_queries = _dedupe_queries(
             [
-                original_query,
                 user_query.english_query,
-                *_keyword_synonym_queries(user_query),
+                *keyword_queries,
+                original_query,
             ]
         )
         return vector_queries, bm25_queries
@@ -91,6 +103,8 @@ def _search_vector_many(queries: list[str], top_k: int) -> list[dict[str, Any]]:
 def _search_vector(query: str, top_k: int) -> list[dict[str, Any]]:
     if top_k <= 0 or not CHROMA_DIR.exists():
         return []
+    if _VECTOR_LAST_ERROR and not _vector_strict():
+        return []
 
     try:
         import chromadb
@@ -107,17 +121,20 @@ def _search_vector(query: str, top_k: int) -> list[dict[str, Any]]:
             n_results=top_k,
             include=["metadatas", "distances"],
         )
-    except Exception:
+        metadatas = result.get("metadatas", [[]])[0]
+        distances = result.get("distances", [[]])[0]
+        return [
+            {
+                **dict(metadata or {}),
+                "vector_score": distance,
+            }
+            for metadata, distance in zip(metadatas, distances)
+        ]
+    except Exception as exc:
+        _remember_vector_error(exc)
+        if _vector_strict():
+            raise RuntimeError(f"Vector search is unavailable: {_VECTOR_LAST_ERROR}") from exc
         return []
-    metadatas = result.get("metadatas", [[]])[0]
-    distances = result.get("distances", [[]])[0]
-    return [
-        {
-            **dict(metadata or {}),
-            "vector_score": distance,
-        }
-        for metadata, distance in zip(metadatas, distances)
-    ]
 
 
 def _search_bm25_many(queries: list[str], top_k: int) -> list[dict[str, Any]]:
@@ -215,5 +232,57 @@ def _embedding_model() -> Any:
     return SentenceTransformer(
         EMBEDDING_MODEL,
         cache_folder=str(EMBEDDING_CACHE_DIR),
-        local_files_only=True,
+        local_files_only=_embedding_local_files_only(),
     )
+
+
+def vector_search_status() -> dict[str, Any]:
+    status: dict[str, Any] = {
+        "chroma_dir_exists": CHROMA_DIR.exists(),
+        "collection_name": COLLECTION_NAME,
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_cache_dir": str(EMBEDDING_CACHE_DIR),
+        "embedding_cache_has_files": any(EMBEDDING_CACHE_DIR.rglob("*"))
+        if EMBEDDING_CACHE_DIR.exists()
+        else False,
+        "embedding_local_only": _embedding_local_files_only(),
+        "vector_strict": _vector_strict(),
+        "chromadb_installed": find_spec("chromadb") is not None,
+        "sentence_transformers_installed": find_spec("sentence_transformers") is not None,
+        "last_error": _VECTOR_LAST_ERROR,
+    }
+
+    if status["chromadb_installed"] and CHROMA_DIR.exists():
+        try:
+            import chromadb
+
+            collection = chromadb.PersistentClient(path=str(CHROMA_DIR)).get_collection(
+                COLLECTION_NAME,
+            )
+            status["collection_count"] = collection.count()
+        except Exception as exc:
+            status["collection_error"] = f"{type(exc).__name__}: {exc}"
+
+    status["available"] = bool(
+        status["chromadb_installed"]
+        and status["sentence_transformers_installed"]
+        and status["chroma_dir_exists"]
+        and not status.get("collection_error")
+        and not status.get("last_error")
+    )
+    return status
+
+
+def _embedding_local_files_only() -> bool:
+    value = os.getenv(EMBEDDING_LOCAL_ONLY_ENV, "false").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _vector_strict() -> bool:
+    value = os.getenv(VECTOR_STRICT_ENV, "false").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _remember_vector_error(exc: Exception) -> None:
+    global _VECTOR_LAST_ERROR
+    _VECTOR_LAST_ERROR = f"{type(exc).__name__}: {exc}"

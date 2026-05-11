@@ -14,7 +14,9 @@ DEFAULT_INDEX_PATH = ROOT / "data" / "catalog_bm25.sqlite"
 LEXICAL_FIELDS = (
     "record_id",
     "dataset_id",
+    "source",
     "title",
+    "search_text",
     "tags",
     "dimensions",
     "source_name",

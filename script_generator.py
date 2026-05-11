@@ -517,6 +517,8 @@ def _template_script_content() -> str:
                 return clean_cell(first_non_empty(source_row.get("period"), source_row.get("date"), source_row.get("time")))
 
             if role == "indicator":
+                if not source_matches_indicator(column, source, context):
+                    return None
                 if not indicator_allows_source_value(column, source):
                     return None
                 value = first_non_empty(
@@ -528,6 +530,51 @@ def _template_script_content() -> str:
                 return numeric_or_clean(value)
 
             return None
+
+
+        def source_matches_indicator(column, source, context):
+            columns = (context.get("target_structure") or {}).get("columns") or []
+            indicator_columns = [
+                item for item in columns
+                if item.get("role") == "indicator" and item.get("name")
+            ]
+            if len(indicator_columns) <= 1:
+                return True
+
+            column_text = " ".join(str(column.get(key) or "") for key in ("name", "title", "source_field", "description"))
+            source_text = " ".join(str(source.get(key) or "") for key in (
+                "dataset_id",
+                "title",
+                "description",
+                "unit",
+                "source_name",
+                "why_matched",
+            ))
+            source_key = normalize_key(source_text)
+            for token in meaningful_indicator_tokens(column_text):
+                if normalize_key(token) in source_key:
+                    return True
+            return False
+
+
+        def meaningful_indicator_tokens(text):
+            generic = {
+                "value", "values", "indicator", "metric", "measure", "data", "series",
+                "rate", "growth", "annual", "year", "years", "current", "constant",
+                "price", "prices", "index", "total", "level", "percent", "percentage",
+                "значение", "значения", "показатель", "метрика", "данные", "ряд",
+                "темп", "рост", "год", "годы", "годовой", "индекс", "уровень",
+                "процент", "проценты", "общий", "итого",
+            }
+            tokens = re.findall(r"[a-zа-я0-9]{3,}", str(text).lower())
+            result = []
+            seen = set()
+            for token in tokens:
+                if token in generic or token in seen:
+                    continue
+                result.append(token)
+                seen.add(token)
+            return result
 
 
         def indicator_allows_source_value(column, source):
@@ -622,9 +669,30 @@ def _template_script_content() -> str:
             if not visualizations or not indicator_name:
                 return []
             chart_rows = []
+            seen_specs = set()
             for visualization in visualizations:
-                metric = visualization.get("y_axis") or indicator_name
-                metric_column = resolve_metric_column(metric, columns) or indicator_name
+                metric_candidates = [
+                    visualization.get("y_axis"),
+                    *list(visualization.get("metrics_used") or []),
+                ]
+                metric_column = None
+                for metric in metric_candidates:
+                    metric_column = resolve_metric_column(metric, columns)
+                    if metric_column:
+                        break
+                if not metric_column and not any(metric_candidates):
+                    metric_column = indicator_name
+                if not metric_column:
+                    continue
+                spec_key = (
+                    str(visualization.get("chart_type") or "").lower(),
+                    normalize_key(visualization.get("x_axis")),
+                    metric_column,
+                    normalize_key(visualization.get("grouping")),
+                )
+                if spec_key in seen_specs:
+                    continue
+                seen_specs.add(spec_key)
                 for row in rows:
                     value = row.get(metric_column)
                     if value in (None, ""):
