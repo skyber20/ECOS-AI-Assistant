@@ -3,9 +3,14 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from intent_parser import ResearchIntent, none_to_empty_list
-from research_designer import ResearchStudyDesign
-from target_dataset_designer import DatasetColumn, TargetDatasetStructure
+try:
+    from agent.intent_parser import ResearchIntent, none_to_empty_list
+    from agent.research_designer import ResearchStudyDesign
+    from agent.target_dataset_designer import DatasetColumn, TargetDatasetStructure
+except ImportError:  # pragma: no cover - keeps direct `python agent/...` runs working.
+    from intent_parser import ResearchIntent, none_to_empty_list  # type: ignore
+    from research_designer import ResearchStudyDesign  # type: ignore
+    from target_dataset_designer import DatasetColumn, TargetDatasetStructure  # type: ignore
 
 
 class DatasetMatchStatus(str, Enum):

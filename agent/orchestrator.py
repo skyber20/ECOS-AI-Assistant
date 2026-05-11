@@ -24,16 +24,28 @@ from agent.intent_parser import (
     _parse_intent_json,
     create_llm_settings,
 )
-from research_designer import (
-    ResearchStudyDesign,
-    _parse_design_json,
-    build_research_design_messages,
-)
-from target_dataset_designer import (
-    TargetDatasetStructure,
-    _parse_target_dataset_json,
-    build_target_dataset_messages,
-)
+try:
+    from agent.research_designer import (
+        ResearchStudyDesign,
+        _parse_design_json,
+        build_research_design_messages,
+    )
+    from agent.target_dataset_designer import (
+        TargetDatasetStructure,
+        _parse_target_dataset_json,
+        build_target_dataset_messages,
+    )
+except ImportError:  # pragma: no cover - keeps direct `python agent/...` runs working.
+    from research_designer import (  # type: ignore
+        ResearchStudyDesign,
+        _parse_design_json,
+        build_research_design_messages,
+    )
+    from target_dataset_designer import (  # type: ignore
+        TargetDatasetStructure,
+        _parse_target_dataset_json,
+        build_target_dataset_messages,
+    )
 
 
 class OrchestrationStatus(str, Enum):
