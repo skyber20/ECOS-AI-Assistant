@@ -100,7 +100,7 @@ class ResearchAgentState(TypedDict, total=False):
     result: OrchestrationResult
 
 
-REFINE_INTENT_PROMPT = """Ты обновляешь JSON ResearchIntent после уточнений пользователя.
+REFINE_INTENT_PROMPT = """Ты обновляешь JSON первого этапа ResearchIntent после уточнений пользователя.
 
 На входе:
 1. предыдущий ResearchIntent;
@@ -494,9 +494,9 @@ def prepare_intent_for_design(
 
 
 def validate_intent_for_design(intent: ResearchIntent) -> list[ClarificationRequest]:
-    if intent.next_action != NextAction.ASK_CLARIFICATION:
-        return []
-    return _requests_from_model_questions(intent)
+    if intent.next_action == NextAction.ASK_CLARIFICATION:
+        return _requests_from_model_questions(intent)
+    return _structural_validation_requests(intent)
 
 
 def _requests_from_model_questions(intent: ResearchIntent) -> list[ClarificationRequest]:
@@ -504,16 +504,96 @@ def _requests_from_model_questions(intent: ResearchIntent) -> list[Clarification
     ambiguities = intent.ambiguities or []
 
     for index, question in enumerate(intent.clarifying_questions):
+        reason = ambiguities[index] if index < len(ambiguities) else "Запрос требует уточнения."
         requests.append(
             ClarificationRequest(
-                field=f"clarification_{index + 1}",
-                reason=ambiguities[index] if index < len(ambiguities) else "Запрос требует уточнения.",
+                field=_infer_clarification_field(question, reason, index),
+                reason=reason,
                 question=question,
                 default_assumption=_default_at(intent, index),
             )
         )
 
+    return _dedupe_requests(requests)
+
+
+def _structural_validation_requests(intent: ResearchIntent) -> list[ClarificationRequest]:
+    requests: list[ClarificationRequest] = []
+
+    if intent.indicators and _indicator_specs_incomplete(intent):
+        requests.append(
+            ClarificationRequest(
+                field="indicator_specs",
+                reason="Не хватает методического определения или единицы измерения показателя.",
+                question="Уточните методику и единицу измерения ключевых показателей.",
+                default_assumption=_matching_default(
+                    intent,
+                    ("показател", "метод", "единиц", "ипц", "инфляц"),
+                ),
+            )
+        )
+
+    if _dataset_spec_incomplete(intent):
+        requests.append(
+            ClarificationRequest(
+                field="dataset_spec",
+                reason="Не хватает структуры целевого датасета: зернистости строки, колонок или частоты.",
+                question="Уточните ожидаемую структуру датасета: зернистость строки, колонки и частоту.",
+                default_assumption=_matching_default(
+                    intent,
+                    ("датасет", "структур", "колон", "зернист", "частот"),
+                ),
+            )
+        )
+
     return requests
+
+
+def _indicator_specs_incomplete(intent: ResearchIntent) -> bool:
+    if not intent.indicator_specs:
+        return True
+    return any(not spec.definition or not spec.unit for spec in intent.indicator_specs)
+
+
+def _dataset_spec_incomplete(intent: ResearchIntent) -> bool:
+    spec = intent.dataset_spec
+    if not spec:
+        return True
+    return not spec.row_grain or not spec.columns or not spec.frequency
+
+
+def _infer_clarification_field(question: str, reason: str, index: int) -> str:
+    text = f"{question} {reason}".lower()
+    field_markers = (
+        ("geography", ("географ", "страна", "регион", "территор", "country", "region")),
+        ("time_range", ("период", "год", "врем", "дат", "year", "period", "time")),
+        ("frequency", ("частот", "месяч", "квартал", "годов", "frequency")),
+        ("indicator_specs", ("показател", "метод", "единиц", "definition", "unit", "indicator")),
+        ("dataset_spec", ("датасет", "колон", "строк", "зернист", "dataset", "column", "grain")),
+    )
+    for field, markers in field_markers:
+        if any(marker in text for marker in markers):
+            return field
+    return f"clarification_{index + 1}"
+
+
+def _dedupe_requests(requests: list[ClarificationRequest]) -> list[ClarificationRequest]:
+    result: list[ClarificationRequest] = []
+    seen: set[str] = set()
+    for request in requests:
+        if request.field in seen:
+            continue
+        result.append(request)
+        seen.add(request.field)
+    return result
+
+
+def _matching_default(intent: ResearchIntent, markers: tuple[str, ...]) -> str | None:
+    for assumption in intent.assumptions_if_no_answer:
+        text = assumption.lower()
+        if any(marker in text for marker in markers):
+            return assumption
+    return None
 
 
 def _result_clarifications(state: ResearchAgentState) -> list[ClarificationRequest]:

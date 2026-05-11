@@ -5,6 +5,7 @@
 data/
 storage/
 artifacts/
+dumps/
 
 # User-specific stuff
 .idea/

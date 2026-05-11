@@ -1,0 +1,7 @@
+# Optional vector-index dependencies.
+# The Docker image does not install these by default because the HuggingFace
+# stack pulls torch and large CUDA wheels on Linux.
+chromadb~=1.3
+llama-index~=0.14
+llama-index-vector-stores-chroma~=0.5
+llama-index-embeddings-huggingface~=0.6

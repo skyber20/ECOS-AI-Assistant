@@ -1,0 +1,12 @@
+.git
+.idea
+.pytest_cache
+.venv
+.env
+__pycache__
+*.py[cod]
+*$py.class
+.DS_Store
+artifacts
+data
+dumps
