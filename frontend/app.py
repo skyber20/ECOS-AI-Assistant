@@ -61,8 +61,6 @@ def clear_all():
     """Set flag to clear everything on next rerun"""
     st.session_state.trigger_clear = True
 
-
-# Process triggers in the main flow (not in callbacks)
 if st.session_state.trigger_clear:
     st.session_state.messages = []
     st.session_state.result = None
@@ -102,14 +100,12 @@ if st.session_state.trigger_submit:
         "used_default": False
     })
 
-    # Переход к следующему вопросу
     idx = st.session_state.current_question_index + 1
     if idx < len(st.session_state.clarification_requests):
         st.session_state.current_question_index = idx
         st.session_state.current_question = st.session_state.clarification_requests[idx]
         st.session_state.status = f"Уточнение {idx + 1}/{len(st.session_state.clarification_requests)}"
     else:
-        # Отправляем ответы на бекенд
         st.session_state.status = "Отправка уточнений..."
         st.session_state.is_processing = True
     st.rerun()
@@ -159,7 +155,6 @@ def send_clarification_answers():
 
 
 def handle_api_response(response: dict):
-    # Проверка на null/None ответ
     if response is None:
         st.session_state.messages.append({
             "role": "assistant",
@@ -174,11 +169,9 @@ def handle_api_response(response: dict):
 
     status = response.get("status")
     
-    # Сохраняем session_id если пришел
     if response.get("session_id"):
         st.session_state.session_id = response["session_id"]
 
-    # Обработка ошибок
     if status == "error":
         error_msg = response.get("error", "Неизвестная ошибка")
         st.session_state.messages.append({
@@ -192,11 +185,9 @@ def handle_api_response(response: dict):
         st.session_state.clarification_answers = []
         return
 
-    # Обработка design_ready
     if status == "design_ready":
         result = response.get("result")
         if result is None:
-            # Если result = null, но статус design_ready
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": "✅ Дизайн исследования создан, но результат не содержит данных. Возможно, запрос требует уточнения."
@@ -210,21 +201,21 @@ def handle_api_response(response: dict):
                 "result": result
             })
         st.session_state.status = "Готов к запросу"
+        st.session_state.is_processing = False
         st.session_state.clarification_requests = []
         st.session_state.current_question = None
-        st.session_state.clarification_answers = []
+        st.session_state.clarification_answers = [] 
 
-    # Обработка needs_clarification
     elif status == "needs_clarification":
         clarification_requests = response.get("clarification_requests", [])
         if not clarification_requests:
-            # Если запрошены уточнения, но список пуст
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": "ℹ️ Требуются уточнения, но система не смогла сформулировать вопросы. Попробуйте описать задачу подробнее."
             })
             st.session_state.status = "Готов к запросу"
             st.session_state.is_processing = False
+            st.session_state.clarification_answers = []
             return
         
         st.session_state.clarification_requests = clarification_requests
@@ -237,7 +228,6 @@ def handle_api_response(response: dict):
             "content": response.get("response", "Нужны уточнения.")
         })
 
-    # Обработка других статусов
     else:
         response_text = response.get("response") or response.get("error") or "Неизвестный статус"
         if response_text is None:
@@ -250,9 +240,11 @@ def handle_api_response(response: dict):
             "result": result if result else None
         })
         st.session_state.status = "Готов к запросу"
+        st.session_state.clarification_requests = [] 
+        st.session_state.current_question = None  
+        st.session_state.clarification_answers = []
 
     st.session_state.is_processing = False
-
 
 def process_initial_request():
     last_user_message = next(
@@ -299,7 +291,6 @@ def process_initial_request():
         st.session_state.is_processing = False
 
 
-# Основная логика
 if st.session_state.is_processing and not st.session_state.clarification_answers:
     process_initial_request()
     st.rerun()
@@ -308,7 +299,6 @@ if st.session_state.is_processing and st.session_state.clarification_answers:
     send_clarification_answers()
     st.rerun()
 
-# Интерфейс
 chat_container = st.container()
 
 with chat_container:
@@ -327,25 +317,33 @@ with chat_container:
         with st.chat_message("assistant"):
             st.write("✍️ Анализирую запрос...")
 
-# Поле ввода или уточнений
 st.divider()
 
 if st.session_state.current_question is not None:
-    # Режим уточнений
     st.info(f"**{st.session_state.status}**")
     question = st.session_state.current_question
+    
     with st.container():
         st.markdown(f"### ❓ {question['question']}")
-        st.caption(f"Поле: {question['field']}. Причина: {question['reason']}")
+        
+        info_col1, info_col2 = st.columns(2)
+        with info_col1:
+            st.caption(f"📌 Поле: **{question['field']}**")
+        with info_col2:
+            st.caption(f"💭 Причина: {question['reason']}")
+        
         if question.get("default_assumption"):
-            st.caption(f"Default: {question['default_assumption']}")
-
-        col1, col2, col3 = st.columns([4, 1, 1])
+            st.caption(f"🔧 Значение по умолчанию: _{question['default_assumption']}_")
+        
+        st.markdown("---")
+        
+        col1, col2, col3 = st.columns([5, 1, 1])
         with col1:
             st.text_input(
                 "Ваш ответ:",
                 key="clarification_input",
-                placeholder="Введите ответ или нажмите Пропустить для default",
+                placeholder="Введите ответ или нажмите «Пропустить» для использования значения по умолчанию",
+                label_visibility="collapsed"
             )
         with col2:
             st.button(
@@ -364,24 +362,24 @@ if st.session_state.current_question is not None:
             )
 
 elif not st.session_state.is_processing:
-    # Обычный режим ввода
-    col1, col2 = st.columns([4, 1])
-    with col1:
-        st.text_input(
-            "Введите сообщение...",
-            key="user_input",
-            placeholder="Напишите исследовательский запрос..."
-        )
-    with col2:
-        st.button(
-            "📤 Отправить",
-            on_click=send_message,
-            disabled=st.session_state.is_processing or not st.session_state.get("user_input", ""),
-            use_container_width=True
-        )
+    with st.container():
+        col1, col2 = st.columns([5, 1])
+        with col1:
+            st.text_input(
+                "Введите сообщение...",
+                key="user_input",
+                placeholder="Напишите исследовательский запрос...",
+                label_visibility="collapsed"
+            )
+        with col2:
+            st.button(
+                "📤 Отправить",
+                on_click=send_message,
+                disabled=st.session_state.is_processing or not st.session_state.get("user_input", ""),
+                use_container_width=True
+            )
 
 
-# Боковая панель
 with st.sidebar:
     st.header("ℹ️ Информация")
     st.write("**Статус:**", st.session_state.status)
@@ -401,6 +399,7 @@ with st.sidebar:
 
 st.markdown("""
 <style>
+/* Базовые стили */
 .stTextInput > div > div > input {
     font-size: 16px;
 }
@@ -410,6 +409,30 @@ st.markdown("""
 .main .block-container {
     padding-top: 1rem;
     padding-bottom: 0rem;
+}
+
+/* Выравнивание кнопок по высоте с полями ввода */
+div[data-testid="column"]:has(button) {
+    display: flex;
+    align-items: flex-end;
+    padding-bottom: 0px;
+}
+
+/* Добавляем отступ для кнопок в контейнере с полем ввода */
+div[data-testid="column"] button {
+    margin-top: 0px;
+    height: 46px;
+}
+
+/* Стили для улучшения отображения в режиме уточнений */
+div[data-testid="stCaption"] {
+    font-size: 14px;
+    margin-bottom: 10px;
+}
+
+/* Убираем лишние отступы у разделителя */
+hr {
+    margin: 10px 0px;
 }
 </style>
 """, unsafe_allow_html=True)

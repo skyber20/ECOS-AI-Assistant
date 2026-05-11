@@ -32,18 +32,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Глобальное хранилище для отслеживания сессий
 sessions: dict = {}
 
 
 class AgentRequest(BaseModel):
     prompt: str
-    session_id: Optional[str] = None  # Добавляем ID сессии
+    session_id: Optional[str] = None 
     context: Optional[dict] = None
 
 
 class ClarificationRequest(BaseModel):
-    session_id: Optional[str] = None  # Добавляем ID сессии
+    session_id: Optional[str] = None 
     answers: Optional[List[dict]] = None
 
 
@@ -53,7 +52,7 @@ class AgentResponse(BaseModel):
     result: Optional[dict] = None
     clarification_requests: Optional[List[dict]] = None
     error: Optional[str] = None
-    session_id: Optional[str] = None  # Возвращаем ID сессии
+    session_id: Optional[str] = None 
 
 
 def get_or_create_session(session_id: Optional[str] = None) -> tuple[str, dict]:
@@ -61,7 +60,6 @@ def get_or_create_session(session_id: Optional[str] = None) -> tuple[str, dict]:
     if session_id and session_id in sessions:
         return session_id, sessions[session_id]
     
-    # Создаем новую сессию
     import uuid
     new_id = session_id or str(uuid.uuid4())
     sessions[new_id] = {
@@ -82,7 +80,6 @@ def process_orchestration_result(result: OrchestrationResult, session_id: str) -
     logger.info(f"Intent: {result.intent}")
     logger.info(f"Design: {result.research_design}")
     
-    # Сохраняем intent для будущих запросов
     if result.intent:
         session["intent"] = result.intent
     
@@ -131,10 +128,8 @@ async def run_agent(request: AgentRequest):
         logger.info(f"Starting new research for session {session_id}")
         logger.info(f"Prompt: {request.prompt}")
         
-        # Получаем агента для этой сессии
         agent = session["agent"]
         
-        # Запускаем flow
         result = agent.run(
             query=request.prompt,
             use_defaults=request.context.get("use_defaults", False) if request.context else False
@@ -180,19 +175,15 @@ async def clarify_agent(request: ClarificationRequest):
         logger.info(f"Clarifying for session {request.session_id}")
         
         if request.answers:
-            # Конвертируем ответы
             answers = [
                 ClarificationAnswer(**answer) for answer in request.answers
             ]
             
-            # Обновляем intent с ответами
             refined_intent = agent.refine_intent(intent, answers)
             session["intent"] = refined_intent
             
-            # Продолжаем flow с уточненным intent
             result = agent.continue_from_intent(refined_intent)
         else:
-            # Продолжаем без ответов
             result = agent.continue_from_intent(intent)
         
         logger.info(f"Clarification result: {result}")
