@@ -237,7 +237,7 @@ class IntentParserSchemaTest(unittest.TestCase):
 
         self.assertEqual(settings.provider, "yandex")
         self.assertEqual(settings.mode, LLMMode.CHAT_COMPLETIONS)
-        self.assertEqual(settings.model, "gpt://test-project/yandexgpt/latest")
+        self.assertEqual(settings.model, "gpt://test-project/qwen3.6-35b-a3b/latest")
 
     def test_chat_completion_sends_system_prompt_and_json_format(self) -> None:
         class FakeCompletions:

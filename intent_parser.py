@@ -79,6 +79,9 @@ class LLMSettings:
     model: str | None = None
 
 
+YANDEX_DEFAULT_MODEL_NAME = "qwen3.6-35b-a3b"
+
+
 class TimeRange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -414,7 +417,7 @@ def _create_yandex_settings(model: str | None = None) -> LLMSettings:
     base_url = _get_env("YANDEX_BASE_URL") or "https://ai.api.cloud.yandex.net/v1"
     project = _get_env("YANDEX_PROJECT")
     llm_model = model or _get_env("YANDEX_MODEL") or (
-        f"gpt://{project}/yandexgpt/latest" if project else None
+        f"gpt://{project}/{YANDEX_DEFAULT_MODEL_NAME}/latest" if project else None
     )
 
     if not api_key:
