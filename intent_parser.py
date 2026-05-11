@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -95,6 +96,30 @@ class TimeRange(BaseModel):
         default=False,
         description="True when the user explicitly specified the period.",
     )
+
+
+def normalize_time_range(value: Any) -> Any:
+    if value is None or isinstance(value, (dict, TimeRange)):
+        return value
+    if not isinstance(value, str):
+        return value
+
+    text = " ".join(value.split())
+    if not text:
+        return None
+
+    years = [int(item) for item in re.findall(r"(?<!\d)(?:18|19|20|21)\d{2}(?!\d)", text)]
+    start_year = years[0] if years else None
+    end_year = years[-1] if years else None
+    if start_year is not None and end_year is not None and start_year > end_year:
+        start_year, end_year = end_year, start_year
+
+    return {
+        "raw": text,
+        "start_year": start_year,
+        "end_year": end_year,
+        "is_explicit": True,
+    }
 
 
 class IndicatorSpec(BaseModel):
@@ -252,6 +277,11 @@ class ResearchIntent(BaseModel):
     geography: list[str] = Field(default_factory=list)
     time_range: TimeRange | None = None
     frequency: str | None = Field(default=None, description="Annual, monthly, quarterly, etc.")
+
+    @field_validator("time_range", mode="before")
+    @classmethod
+    def _normalize_time_range(cls, value: Any) -> Any:
+        return normalize_time_range(value)
 
     @field_validator("frequency", mode="before")
     @classmethod
@@ -417,6 +447,22 @@ JSON-схема верхнего уровня:
 """
 
 
+REPAIR_RESPONSE_PROMPT = """Ты исправляешь только JSON-ответ предыдущего шага ResearchIntent.
+
+На входе:
+- исходный пользовательский запрос;
+- невалидный JSON-ответ LLM;
+- ошибка парсера/валидатора.
+
+Правила:
+- Верни только полный валидный JSON ResearchIntent без Markdown.
+- Не меняй смысл пользовательского запроса.
+- Не выдумывай новые данные, источники, показатели или периоды.
+- Исправляй только формат, типы полей и значения enum так, чтобы JSON прошел схему.
+- Если поле неизвестно, используй null или пустой список согласно схеме.
+"""
+
+
 class IntentParserError(RuntimeError):
     """Raised when the model response cannot be converted to ResearchIntent."""
 
@@ -530,7 +576,7 @@ def parse_research_intent(
     ]
 
     content = _create_json_completion(settings, messages)
-    return _parse_intent_json(content, original_query=query)
+    return _parse_intent_json_with_repair(content, original_query=query, settings=settings)
 
 
 def _create_json_completion(
@@ -574,6 +620,59 @@ def _parse_intent_json(content: str, original_query: str) -> ResearchIntent:
         raise IntentParserError(f"LLM JSON does not match ResearchIntent schema: {exc}") from exc
 
     return _apply_deterministic_corrections(intent)
+
+
+def _parse_intent_json_with_repair(
+    content: str,
+    original_query: str,
+    settings: LLMSettings,
+    max_repairs: int = 2,
+) -> ResearchIntent:
+    current_content = content
+    last_error: IntentParserError | None = None
+    for repair_number in range(max_repairs + 1):
+        try:
+            return _parse_intent_json(current_content, original_query=original_query)
+        except IntentParserError as exc:
+            last_error = exc
+            if repair_number >= max_repairs:
+                break
+            current_content = _create_json_completion(
+                settings,
+                build_intent_response_repair_messages(
+                    original_query=original_query,
+                    invalid_response=current_content,
+                    parser_error=str(exc),
+                ),
+            )
+
+    raise last_error or IntentParserError("LLM response repair failed.")
+
+
+def build_intent_response_repair_messages(
+    original_query: str,
+    invalid_response: str,
+    parser_error: str,
+) -> list[dict[str, str]]:
+    payload = {
+        "original_query": original_query,
+        "invalid_response": invalid_response,
+        "parser_error": parser_error,
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                f"{REPAIR_RESPONSE_PROMPT}\n\n"
+                "JSON Schema:\n"
+                f"{json.dumps(ResearchIntent.model_json_schema(), ensure_ascii=False, indent=2)}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(payload, ensure_ascii=False, indent=2),
+        },
+    ]
 
 
 def _load_json_object(content: str) -> dict[str, Any]:

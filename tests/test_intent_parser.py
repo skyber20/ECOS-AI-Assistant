@@ -10,8 +10,10 @@ from intent_parser import (
     LLMSettings,
     NextAction,
     SYSTEM_PROMPT,
+    _parse_intent_json_with_repair,
     _create_json_completion,
     _parse_intent_json,
+    build_intent_response_repair_messages,
     create_llm_settings,
 )
 
@@ -192,6 +194,142 @@ class IntentParserSchemaTest(unittest.TestCase):
 
         self.assertEqual(intent.frequency, "годовая")
         self.assertEqual(intent.dataset_spec.frequency, "годовая")
+
+    def test_normalizes_string_time_range_from_llm_response(self) -> None:
+        payload = {
+            "schema_version": "1.1",
+            "original_query": "Покажи показатель за 2010-2020",
+            "intent_type": "simple_data",
+            "complexity": "easy",
+            "topic": None,
+            "objects": [],
+            "geography": ["Россия"],
+            "time_range": "2010-2020",
+            "frequency": "annual",
+            "disciplinary_perspective": None,
+            "indicators": ["показатель"],
+            "indicator_specs": [],
+            "entities": [],
+            "granularity": None,
+            "research_questions": [],
+            "research_design": None,
+            "derived_metrics": [],
+            "dataset_spec": None,
+            "source_candidates": [],
+            "data_availability": {
+                "status": "unknown",
+                "verdict": None,
+                "reasons": [],
+                "alternatives": [],
+            },
+            "ambiguities": [],
+            "clarifying_questions": [],
+            "assumptions_if_no_answer": [],
+            "confidence": 0.5,
+            "next_action": "proceed_with_assumptions",
+        }
+
+        intent = _parse_intent_json(json.dumps(payload, ensure_ascii=False), "fallback")
+
+        self.assertEqual(intent.time_range.raw, "2010-2020")
+        self.assertEqual(intent.time_range.start_year, 2010)
+        self.assertEqual(intent.time_range.end_year, 2020)
+        self.assertTrue(intent.time_range.is_explicit)
+
+    def test_repairs_invalid_intent_response_without_changing_tool(self) -> None:
+        invalid_payload = {
+            "schema_version": "1.1",
+            "original_query": "Покажи инфляцию России за 2020-2024",
+            "intent_type": "simple_data",
+            "complexity": "easy",
+            "topic": "инфляция России",
+            "objects": [],
+            "geography": ["Россия"],
+            "time_range": None,
+            "frequency": "годовая",
+            "disciplinary_perspective": None,
+            "indicators": ["инфляция"],
+            "indicator_specs": [],
+            "entities": [],
+            "granularity": None,
+            "research_questions": [],
+            "research_design": None,
+            "derived_metrics": [],
+            "dataset_spec": None,
+            "source_candidates": [],
+            "data_availability": {
+                "status": "unknown",
+                "verdict": None,
+                "reasons": [],
+                "alternatives": [],
+            },
+            "ambiguities": [],
+            "clarifying_questions": [],
+            "assumptions_if_no_answer": [],
+            "confidence": "high",
+            "next_action": "proceed_with_assumptions",
+        }
+        fixed_payload = dict(invalid_payload, confidence=0.8)
+
+        class FakeCompletions:
+            def __init__(self) -> None:
+                self.request = None
+
+            def create(self, **kwargs):
+                self.request = kwargs
+
+                class Message:
+                    content = json.dumps(fixed_payload, ensure_ascii=False)
+
+                class Choice:
+                    message = Message()
+
+                class Response:
+                    choices = [Choice()]
+
+                return Response()
+
+        class FakeChat:
+            def __init__(self) -> None:
+                self.completions = FakeCompletions()
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.chat = FakeChat()
+
+        client = FakeClient()
+        settings = LLMSettings(
+            provider="yandex",
+            client=client,
+            mode=LLMMode.CHAT_COMPLETIONS,
+            model="gpt://test-project/yandexgpt/latest",
+        )
+
+        intent = _parse_intent_json_with_repair(
+            json.dumps(invalid_payload, ensure_ascii=False),
+            original_query="fallback",
+            settings=settings,
+            max_repairs=1,
+        )
+
+        request = client.chat.completions.request
+        self.assertEqual(intent.confidence, 0.8)
+        self.assertIn("исправляешь только JSON-ответ", request["messages"][0]["content"])
+        repair_payload = json.loads(request["messages"][1]["content"])
+        self.assertIn("confidence", repair_payload["parser_error"])
+        self.assertIn('"confidence": "high"', repair_payload["invalid_response"])
+
+    def test_repair_prompt_contains_invalid_response_and_error(self) -> None:
+        messages = build_intent_response_repair_messages(
+            original_query="Покажи инфляцию",
+            invalid_response='{"confidence": "high"}',
+            parser_error="confidence should be a number",
+        )
+
+        payload = json.loads(messages[1]["content"])
+        self.assertIn("ResearchIntent", messages[0]["content"])
+        self.assertEqual(payload["original_query"], "Покажи инфляцию")
+        self.assertEqual(payload["parser_error"], "confidence should be a number")
 
     def test_loads_qwen_settings_from_env(self) -> None:
         env = {
