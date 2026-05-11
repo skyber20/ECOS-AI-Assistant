@@ -70,6 +70,7 @@ def get_or_create_session(session_id: Optional[str] = None) -> tuple[str, dict]:
     }
     return new_id, sessions[new_id]
 
+# backend.py - измененные методы
 
 def process_orchestration_result(result: OrchestrationResult, session_id: str) -> AgentResponse:
     """Обработка результата от оркестратора"""
@@ -93,17 +94,50 @@ def process_orchestration_result(result: OrchestrationResult, session_id: str) -
             response=result.message or "Необходимо уточнение",
         )
     
-    if result.status == OrchestrationStatus.DESIGN_READY or result.status == OrchestrationStatus.BUILD_PLAN_READY:
+    if result.status == OrchestrationStatus.DESIGN_READY:
         response_data = {
             "session_id": session_id,
             "status": result.status.value,
-            "response": result.message or "Дизайн исследования готов.",
+            "response": result.message or "Дизайн исследования и скрипт сборки готовы.",
         }
         
+        # Включаем все компоненты результата
         if result.research_design:
-            response_data["result"] = result.research_design.model_dump(
+            response_data["research_design"] = result.research_design.model_dump(
                 mode="json", exclude={"original_query", "blocking_reasons"}
             )
+        
+        if result.dataset_structure:
+            response_data["dataset_structure"] = result.dataset_structure.model_dump(
+                mode="json"
+            )
+        
+        if result.build_script:
+            response_data["build_script"] = result.build_script.model_dump(
+                mode="json"
+            )
+        
+        if result.build_run:
+            response_data["build_run"] = result.build_run.model_dump(
+                mode="json"
+            )
+        
+        if result.dataset_rerank:
+            response_data["dataset_rerank"] = {
+                "results": [
+                    {
+                        "record_id": r.record_id,
+                        "dataset_id": r.dataset_id,
+                        "title": r.title,
+                        "source": r.source,
+                        "relevance": r.relevance.value,
+                        "usefulness_confidence": r.usefulness_confidence.value,
+                        "why_matched": r.why_matched,
+                        "possible_limitations": r.possible_limitations,
+                    }
+                    for r in result.dataset_rerank.results
+                ]
+            }
         
         if result.clarification_requests:
             response_data["clarification_requests"] = [
@@ -112,12 +146,89 @@ def process_orchestration_result(result: OrchestrationResult, session_id: str) -
             
         return AgentResponse(**response_data)
     
+    # Обработка других статусов
+    if result.status == OrchestrationStatus.NO_DATA:
+        return AgentResponse(
+            session_id=session_id,
+            status=result.status.value,
+            response=result.message or "Данные не найдены.",
+        )
+    
+    if result.status == OrchestrationStatus.UNSUPPORTED:
+        return AgentResponse(
+            session_id=session_id,
+            status=result.status.value,
+            response=result.message or "Запрос не поддерживается.",
+        )
+    
     return AgentResponse(
         session_id=session_id,
         status=result.status.value,
         response=result.message or str(result.status.value),
     )
 
+
+@app.get("/api/agent/result/{session_id}")
+async def get_result(session_id: str):
+    """Получить детальный результат сессии"""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    
+    session = sessions[session_id]
+    result = session.get("current_result")
+    
+    if not result:
+        return {"session_id": session_id, "status": "no_result"}
+    
+    response_data = {
+        "session_id": session_id,
+        "status": result.status.value,
+        "message": result.message,
+    }
+    
+    if result.research_design:
+        response_data["research_design"] = result.research_design.model_dump(
+            mode="json", exclude={"original_query", "blocking_reasons"}
+        )
+    
+    if result.dataset_structure:
+        response_data["dataset_structure"] = result.dataset_structure.model_dump(
+            mode="json"
+        )
+    
+    if result.build_script:
+        response_data["build_script"] = result.build_script.model_dump(
+            mode="json"
+        )
+    
+    if result.build_run:
+        response_data["build_run"] = result.build_run.model_dump(
+            mode="json"
+        )
+    
+    if result.dataset_rerank:
+        response_data["dataset_rerank"] = {
+            "results": [
+                {
+                    "record_id": r.record_id,
+                    "dataset_id": r.dataset_id,
+                    "title": r.title,
+                    "source": r.source,
+                    "relevance": r.relevance.value,
+                    "usefulness_confidence": r.usefulness_confidence.value,
+                    "why_matched": r.why_matched,
+                    "possible_limitations": r.possible_limitations,
+                }
+                for r in result.dataset_rerank.results
+            ]
+        }
+    
+    if result.clarification_requests:
+        response_data["clarification_requests"] = [
+            req.model_dump(mode="json") for req in result.clarification_requests
+        ]
+    
+    return response_data
 
 @app.post("/api/agent/run")
 async def run_agent(request: AgentRequest):

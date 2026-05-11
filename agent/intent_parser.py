@@ -79,6 +79,9 @@ class LLMSettings:
     model: str | None = None
 
 
+YANDEX_DEFAULT_MODEL_NAME = "qwen3.6-35b-a3b"
+
+
 class TimeRange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -195,11 +198,50 @@ class DataAvailabilityAssessment(BaseModel):
         return none_to_empty_list(value)
 
 
+class KeywordSynonyms(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    keyword: str = Field(description="Key term from the original user query.")
+    english_keyword: str = Field(description="English equivalent of the key term.")
+    synonyms: list[str] = Field(
+        default_factory=list,
+        max_length=5,
+        description="Short English synonyms or close lexical alternatives for retrieval.",
+    )
+
+    @field_validator("synonyms", mode="before")
+    @classmethod
+    def _none_to_empty_list(cls, value: Any) -> Any:
+        values = none_to_empty_list(value)
+        if not isinstance(values, list):
+            values = [values]
+
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            text = " ".join(str(item).split())
+            key = text.lower()
+            if text and key not in seen:
+                result.append(text)
+                seen.add(key)
+            if len(result) >= 5:
+                break
+        return result
+
+
 class ResearchIntent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: str = "1.1"
+    schema_version: str = "1.2"
     original_query: str
+    english_query: str | None = Field(
+        default=None,
+        description="English translation of the original query for retrieval.",
+    )
+    keyword_synonyms: list[KeywordSynonyms] = Field(
+        default_factory=list,
+        description="English lexical hints for exact metadata retrieval.",
+    )
     intent_type: IntentType
     complexity: Complexity
     topic: str | None = None
@@ -215,6 +257,14 @@ class ResearchIntent(BaseModel):
     @classmethod
     def _normalize_frequency(cls, value: Any) -> Any:
         return normalize_frequency(value)
+
+    @field_validator("english_query", mode="before")
+    @classmethod
+    def _empty_english_query_to_none(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        text = " ".join(str(value).split())
+        return text or None
 
     disciplinary_perspective: str | None = Field(
         default=None,
@@ -253,6 +303,7 @@ class ResearchIntent(BaseModel):
         "research_questions",
         "derived_metrics",
         "source_candidates",
+        "keyword_synonyms",
         "ambiguities",
         "clarifying_questions",
         "assumptions_if_no_answer",
@@ -293,11 +344,18 @@ SYSTEM_PROMPT = """Ты парсер исследовательского нам
 - В source_candidates предлагай вероятные источники и коды показателей, если они широко известны. Не выдавай источник как проверенный факт сбора данных; это кандидаты для следующего шага. Для российских официальных показателей часто уместны Росстат и ЕМИСС.
 - Для no_data не добавляй нерелевантные источники "для вида"; лучше укажи крупные базы/организации, где такие данные обычно проверяются (например World Bank, IMF, ILO, национальная статистика), и объясни отсутствие структурированных данных.
 - Используй русский язык в текстовых полях.
+- Заполни english_query точным английским переводом исходного запроса для retrieval.
+- Заполни keyword_synonyms для ключевых терминов из запроса: keyword из исходного запроса, english_keyword на английском и 3-5 коротких английских synonyms.
+- keyword_synonyms нужны только для точного lexical retrieval. Не добавляй туда новые показатели, географию, периоды, источники или смысл, которых нет в запросе.
 
 JSON-схема верхнего уровня:
 {
-  "schema_version": "1.1",
+  "schema_version": "1.2",
   "original_query": "string",
+  "english_query": "string|null",
+  "keyword_synonyms": [
+    {"keyword": "string", "english_keyword": "string", "synonyms": ["string"]}
+  ],
   "intent_type": "simple_data|comparative|research|derived|ambiguous|no_data|unsupported",
   "complexity": "easy|medium|complex",
   "topic": "string|null",
@@ -380,6 +438,10 @@ def create_llm_settings(
     )
 
 
+def create_llm_client(provider: str | None = None) -> OpenAI:
+    return create_llm_settings(provider=provider).client
+
+
 def _create_qwen_settings(model: str | None = None) -> LLMSettings:
     api_key = _get_env("QWEN_API_KEY")
     base_url = _get_env("QWEN_BASE_URL")
@@ -410,7 +472,7 @@ def _create_yandex_settings(model: str | None = None) -> LLMSettings:
     base_url = _get_env("YANDEX_BASE_URL") or "https://ai.api.cloud.yandex.net/v1"
     project = _get_env("YANDEX_PROJECT")
     llm_model = model or _get_env("YANDEX_MODEL") or (
-        f"gpt://{project}/yandexgpt/latest" if project else None
+        f"gpt://{project}/{YANDEX_DEFAULT_MODEL_NAME}/latest" if project else None
     )
 
     if not api_key:
@@ -438,6 +500,37 @@ def _get_env(*names: str) -> str | None:
         if value and value.strip():
             return value.strip()
     return None
+
+
+def parse_research_intent(
+    query: str,
+    client: OpenAI | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+) -> ResearchIntent:
+    if not query.strip():
+        raise ValueError("Query must not be empty.")
+
+    load_dotenv()
+
+    settings = (
+        LLMSettings(
+            provider=provider or "custom",
+            client=client,
+            mode=LLMMode.CHAT_COMPLETIONS,
+            model=model or _get_env("QWEN_MODEL") or "qwen3.5-122b",
+        )
+        if client
+        else create_llm_settings(provider=provider, model=model)
+    )
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": query},
+    ]
+
+    content = _create_json_completion(settings, messages)
+    return _parse_intent_json(content, original_query=query)
 
 
 def _create_json_completion(
