@@ -1,0 +1,7 @@
+# Optional vector catalog/indexing stack.
+# The web app works without this file via BM25 + LLM reranking.
+-r requirements.txt
+chromadb~=1.3
+llama-index~=0.14
+llama-index-vector-stores-chroma~=0.5
+llama-index-embeddings-huggingface~=0.6

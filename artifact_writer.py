@@ -57,6 +57,14 @@ def write_orchestration_artifacts(
                 result.dataset_structure.model_dump(mode="json"),
             )
         )
+    if result.research_design and result.dataset_structure:
+        artifacts.append(
+            _write_json(
+                directory / "04a_build_generation_context.json",
+                "build_generation_context",
+                _build_generation_context_payload(result),
+            )
+        )
     if result.build_script:
         artifacts.append(
             _write_json(
@@ -162,3 +170,17 @@ def _build_output_artifacts(output: dict[str, Any] | None) -> list[WrittenArtifa
         artifacts.append(WrittenArtifact(artifact_type=f"build_output_{key}", path=path))
 
     return artifacts
+
+
+def _build_generation_context_payload(result: OrchestrationResult) -> dict[str, Any]:
+    if not result.research_design or not result.dataset_structure:
+        return {}
+
+    from script_generator import build_generation_context
+
+    return build_generation_context(
+        result.intent,
+        result.research_design,
+        result.dataset_structure,
+        result.dataset_rerank,
+    )

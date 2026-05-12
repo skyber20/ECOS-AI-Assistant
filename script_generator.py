@@ -53,6 +53,18 @@ class GeneratedBuildScript(BaseModel):
         return none_to_empty_list(value)
 
 
+class GeneratedSqlDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sql: str
+    possible_limitations: list[str] = Field(default_factory=list)
+
+    @field_validator("possible_limitations", mode="before")
+    @classmethod
+    def _none_to_empty_list(cls, value: Any) -> Any:
+        return none_to_empty_list(value)
+
+
 class ScriptExecutionAttempt(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -93,10 +105,9 @@ SQL_GENERATION_PROMPT = """Ты генерируешь DuckDB SQL для сбо�
 - source_tables[].sample_rows: несколько первых строк только для понимания формы таблицы и типов значений.
 
 Правила:
-- Верни только валидный JSON GeneratedBuildScript без Markdown.
+- Верни только валидный JSON GeneratedSqlDraft без Markdown.
 - Не добавляй thinking, reasoning, пояснения, теги <think> или текст вне JSON.
-- language = "sql", filename = "build_target_dataset.sql", entrypoint = "duckdb_sql".
-- content должен быть одним DuckDB SELECT или WITH ... SELECT.
+- Поле sql должно быть одним DuckDB SELECT или WITH ... SELECT.
 - Не пиши Python, CLI, DDL, DML, COPY, CREATE, INSERT, UPDATE, DELETE, DROP, ALTER, INSTALL, LOAD.
 - Не вызывай read_parquet/read_csv/read_json и не указывай файловые пути. Файлы уже доступны как таблицы source_1, source_2 и так далее.
 - Используй только таблицы и колонки из source_tables.
@@ -111,7 +122,6 @@ SQL_GENERATION_PROMPT = """Ты генерируешь DuckDB SQL для сбо�
 - Если годы или периоды представлены отдельными колонками, приведи их к целевой длинной структуре по фактическим именам колонок.
 - Если source_datasets содержит данные только в процентах роста, не называй их уровнем индекса.
 - possible_limitations пиши по-русски, предметно, только из metadata/schema/context.
-- usage коротко объясняет, что SQL выполняется executor через DuckDB поверх source_* таблиц.
 """
 
 
@@ -119,15 +129,15 @@ SQL_REPAIR_PROMPT = """Ты исправляешь DuckDB SQL для сборк�
 
 На входе:
 - исходный JSON-контекст;
-- предыдущий GeneratedBuildScript;
+- предыдущий SQL draft или GeneratedBuildScript;
 - ошибка выполнения.
 
 Правила:
-- Верни полный валидный JSON GeneratedBuildScript без Markdown.
+- Верни полный валидный JSON GeneratedSqlDraft без Markdown.
 - Не добавляй thinking, reasoning, пояснения, теги <think> или текст вне JSON.
 - Сохрани смысл запроса, target_structure и source_tables.
 - Исправляй только причину ошибки или пустого результата.
-- content должен быть одним SELECT или WITH ... SELECT.
+- Поле sql должно быть одним SELECT или WITH ... SELECT.
 - Не используй Python, CLI, DDL, DML, COPY, CREATE, INSERT, UPDATE, DELETE, DROP, ALTER, INSTALL, LOAD.
 - Не читай файлы в SQL. Используй только source_* таблицы и их колонки.
 - Не выдумывай отсутствующие значения.
@@ -156,10 +166,11 @@ def generate_build_script(
     content = _create_schema_completion(
         llm_settings,
         _generation_messages(context),
-        GeneratedBuildScript,
-        "GeneratedBuildScript",
+        GeneratedSqlDraft,
+        "GeneratedSqlDraft",
     )
-    return _parse_generated_script(content, llm_settings, context)
+    draft = _parse_generated_sql_draft(content, llm_settings, context)
+    return _build_script_from_sql_draft(draft, context)
 
 
 def generate_and_run_build_script(
@@ -248,7 +259,7 @@ def _generation_messages(context: dict[str, Any]) -> list[dict[str, str]]:
             "content": (
                 f"{SQL_GENERATION_PROMPT}\n\n"
                 "JSON Schema:\n"
-                f"{json.dumps(GeneratedBuildScript.model_json_schema(), ensure_ascii=False, indent=2)}"
+                f"{json.dumps(GeneratedSqlDraft.model_json_schema(), ensure_ascii=False, indent=2)}"
             ),
         },
         {"role": "user", "content": json.dumps(context, ensure_ascii=False, indent=2)},
@@ -256,7 +267,7 @@ def _generation_messages(context: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def _repair_messages(
-    script: GeneratedBuildScript,
+    script: BaseModel,
     context: dict[str, Any],
     attempt: ScriptExecutionAttempt,
 ) -> list[dict[str, str]]:
@@ -271,32 +282,34 @@ def _repair_messages(
             "content": (
                 f"{SQL_REPAIR_PROMPT}\n\n"
                 "JSON Schema:\n"
-                f"{json.dumps(GeneratedBuildScript.model_json_schema(), ensure_ascii=False, indent=2)}"
+                f"{json.dumps(GeneratedSqlDraft.model_json_schema(), ensure_ascii=False, indent=2)}"
             ),
         },
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
     ]
 
 
-def _parse_generated_script(
+def _parse_generated_sql_draft(
     content: str,
     settings: LLMSettings,
     context: dict[str, Any],
-) -> GeneratedBuildScript:
+) -> GeneratedSqlDraft:
     current_content = content
     last_error: ScriptGeneratorError | None = None
     for repair_number in range(SQL_VALIDATION_REPAIRS + 1):
-        script = parse_llm_json_model(
-            current_content,
-            GeneratedBuildScript,
-            settings=settings,
-            error_type=ScriptGeneratorError,
-            context=context,
-        )
-        script.content = _normalized_sql(script.content)
+        draft = _coerce_sql_draft(current_content)
+        if draft is None:
+            draft = parse_llm_json_model(
+                current_content,
+                GeneratedSqlDraft,
+                settings=settings,
+                error_type=ScriptGeneratorError,
+                context=context,
+            )
+        draft.sql = _normalized_sql(draft.sql)
         try:
-            _validate_sql_content(script.content)
-            return script
+            _validate_sql_content(draft.sql)
+            return draft
         except ScriptGeneratorError as exc:
             last_error = exc
             if repair_number >= SQL_VALIDATION_REPAIRS:
@@ -304,7 +317,7 @@ def _parse_generated_script(
             current_content = _create_schema_completion(
                 settings,
                 _repair_messages(
-                    script,
+                    draft,
                     context,
                     ScriptExecutionAttempt(
                         attempt=repair_number + 1,
@@ -312,11 +325,78 @@ def _parse_generated_script(
                         error=str(exc),
                     ),
                 ),
-                GeneratedBuildScript,
-                "GeneratedBuildScript",
+                GeneratedSqlDraft,
+                "GeneratedSqlDraft",
             )
 
     raise last_error or ScriptGeneratorError("SQL не прошел валидацию.")
+
+
+def _coerce_sql_draft(content: str) -> GeneratedSqlDraft | None:
+    data = _raw_json_object(content)
+    if isinstance(data, dict):
+        raw_sql = data.get("sql") or data.get("content") or data.get("query")
+        if isinstance(raw_sql, str) and raw_sql.strip():
+            return GeneratedSqlDraft(
+                sql=raw_sql,
+                possible_limitations=_coerce_limitations(
+                    data.get("possible_limitations") or data.get("limitations")
+                ),
+            )
+
+    sql = _normalized_sql(content)
+    lowered = sql.lower()
+    if _starts_with_select_or_with(lowered):
+        return GeneratedSqlDraft(sql=sql)
+    return None
+
+
+def _raw_json_object(content: str) -> dict[str, Any] | None:
+    text = content.strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        if start == -1:
+            return None
+        try:
+            data, _ = json.JSONDecoder().raw_decode(text[start:])
+        except json.JSONDecodeError:
+            return None
+    return data if isinstance(data, dict) else None
+
+
+def _coerce_limitations(value: Any) -> list[str]:
+    values = none_to_empty_list(value)
+    if not isinstance(values, list):
+        values = [values]
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def _build_script_from_sql_draft(
+    draft: GeneratedSqlDraft,
+    context: dict[str, Any],
+) -> GeneratedBuildScript:
+    return GeneratedBuildScript(
+        content=_normalized_sql(draft.sql),
+        usage="SQL выполняется executor через DuckDB поверх уже подключенных source_* таблиц.",
+        inputs=[
+            str(table.get("table_name"))
+            for table in context.get("source_tables", [])
+            if table.get("table_name")
+        ],
+        outputs=_default_outputs(),
+        possible_limitations=draft.possible_limitations,
+    )
+
+
+def _parse_generated_script(
+    content: str,
+    settings: LLMSettings,
+    context: dict[str, Any],
+) -> GeneratedBuildScript:
+    draft = _parse_generated_sql_draft(content, settings, context)
+    return _build_script_from_sql_draft(draft, context)
 
 
 def _repair_script(
@@ -328,10 +408,11 @@ def _repair_script(
     content = _create_schema_completion(
         settings,
         _repair_messages(script, context, attempt),
-        GeneratedBuildScript,
-        "GeneratedBuildScript",
+        GeneratedSqlDraft,
+        "GeneratedSqlDraft",
     )
-    return _parse_generated_script(content, settings, context)
+    draft = _parse_generated_sql_draft(content, settings, context)
+    return _build_script_from_sql_draft(draft, context)
 
 
 def _create_schema_completion(
@@ -413,6 +494,8 @@ def _run_duckdb_sql(
     context: dict[str, Any],
     output_path: Path,
 ) -> dict[str, Any]:
+    output_path.mkdir(parents=True, exist_ok=True)
+
     if find_spec("duckdb") is None:
         raise ScriptGeneratorError("Библиотека duckdb не установлена.")
 
@@ -508,7 +591,7 @@ def _create_source_view(con: Any, table: dict[str, Any]) -> None:
 def _validate_sql_content(content: str) -> None:
     sql = _normalized_sql(content)
     lowered = sql.lower()
-    if not (lowered.startswith("select ") or lowered.startswith("with ")):
+    if not _starts_with_select_or_with(lowered):
         raise ScriptGeneratorError("SQL должен начинаться с SELECT или WITH.")
     if ";" in sql.rstrip(";"):
         raise ScriptGeneratorError("SQL должен содержать только один SELECT.")
@@ -531,6 +614,10 @@ def _validate_sql_content(content: str) -> None:
     for token in forbidden:
         if token in lowered:
             raise ScriptGeneratorError(f"SQL содержит запрещенный фрагмент: {token.strip()}")
+
+
+def _starts_with_select_or_with(sql: str) -> bool:
+    return bool(re.match(r"^(select|with)\b", sql, flags=re.IGNORECASE))
 
 
 def _query_uses_readable_source(content: str, context: dict[str, Any]) -> bool:
