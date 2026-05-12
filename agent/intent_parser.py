@@ -417,6 +417,22 @@ JSON-схема верхнего уровня:
 """
 
 
+LLM_JSON_REPAIR_PROMPT = """Ты исправляешь только JSON-ответ LLM под заданную Pydantic schema.
+
+На входе:
+- невалидный JSON-ответ LLM;
+- ошибка парсера/валидатора;
+- дополнительный контекст, если он есть.
+
+Правила:
+- Верни только полный валидный JSON без Markdown.
+- Не меняй смысл исходного запроса и уже заданного контекста.
+- Не выдумывай данные, источники, показатели, периоды или значения наблюдений.
+- Исправляй только формат, типы полей, пропущенные обязательные поля и значения enum так, чтобы JSON прошел schema.
+- Если поле неизвестно, используй null или пустой список согласно schema.
+"""
+
+
 class IntentParserError(RuntimeError):
     """Raised when the model response cannot be converted to ResearchIntent."""
 
@@ -530,7 +546,7 @@ def parse_research_intent(
     ]
 
     content = _create_json_completion(settings, messages)
-    return _parse_intent_json(content, original_query=query)
+    return _parse_intent_json_with_repair(content, original_query=query, settings=settings)
 
 
 def _create_json_completion(
@@ -559,21 +575,87 @@ def _create_json_completion(
     return content
 
 
-def _parse_intent_json(content: str, original_query: str) -> ResearchIntent:
-    try:
-        data = _load_json_object(content)
-    except json.JSONDecodeError as exc:
-        raise IntentParserError(f"LLM returned invalid JSON: {exc}") from exc
-
-    if isinstance(data, dict) and not data.get("original_query"):
-        data["original_query"] = original_query
-
-    try:
-        intent = ResearchIntent.model_validate(data)
-    except ValidationError as exc:
-        raise IntentParserError(f"LLM JSON does not match ResearchIntent schema: {exc}") from exc
-
+def _parse_intent_json_with_repair(
+    content: str,
+    original_query: str,
+    settings: LLMSettings,
+) -> ResearchIntent:
+    intent = parse_llm_json_model(
+        content,
+        ResearchIntent,
+        settings=settings,
+        error_type=IntentParserError,
+        context={"original_query": original_query},
+        defaults={"original_query": original_query},
+    )
     return _apply_deterministic_corrections(intent)
+
+
+def parse_llm_json_model(
+    content: str,
+    model_type: type[BaseModel],
+    settings: LLMSettings | None = None,
+    error_type: type[RuntimeError] = IntentParserError,
+    label: str | None = None,
+    context: dict[str, Any] | None = None,
+    defaults: dict[str, Any] | None = None,
+    extra: str | None = None,
+    max_repairs: int = 2,
+) -> BaseModel:
+    current_content = content
+    schema_name = label or model_type.__name__
+    last_error: RuntimeError | None = None
+
+    for repair_number in range(max_repairs + 1):
+        try:
+            data = _load_json_object(current_content)
+            if defaults:
+                for key, value in defaults.items():
+                    data.setdefault(key, value)
+            if extra is None:
+                return model_type.model_validate(data)
+            return model_type.model_validate(data, extra=extra)
+        except (IntentParserError, json.JSONDecodeError, ValidationError) as exc:
+            last_error = error_type(f"LLM JSON does not match {schema_name} schema: {exc}")
+            if settings is None or repair_number >= max_repairs:
+                raise last_error from exc
+            current_content = _create_json_completion(
+                settings,
+                build_llm_json_repair_messages(
+                    model_type=model_type,
+                    invalid_response=current_content,
+                    parser_error=str(last_error),
+                    context=context,
+                ),
+            )
+
+    raise last_error or error_type(f"LLM JSON repair failed for {schema_name}.")
+
+
+def build_llm_json_repair_messages(
+    model_type: type[BaseModel],
+    invalid_response: str,
+    parser_error: str,
+    context: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    payload = {
+        "invalid_response": invalid_response,
+        "parser_error": parser_error,
+    }
+    if context:
+        payload["context"] = context
+
+    return [
+        {
+            "role": "system",
+            "content": (
+                f"{LLM_JSON_REPAIR_PROMPT}\n\n"
+                "JSON Schema:\n"
+                f"{json.dumps(model_type.model_json_schema(), ensure_ascii=False, indent=2)}"
+            ),
+        },
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
+    ]
 
 
 def _load_json_object(content: str) -> dict[str, Any]:
