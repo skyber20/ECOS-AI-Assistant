@@ -310,7 +310,7 @@ def _append_run(
     if output:
         lines.append("")
         lines.append("Файлы результата:")
-        for key in ["dataset", "metadata", "manifest", "chart_data"]:
+        for key in ["dataset", "metadata", "manifest", "sql", "chart_data"]:
             if output.get(key):
                 lines.append(f"- {key}: {output[key]}")
         if output.get("row_count") is not None:
@@ -353,6 +353,7 @@ def _normalized_output(output: dict[str, Any] | None) -> dict[str, Any]:
         "dataset": _first(output, "dataset", "target_dataset", "csv_path"),
         "metadata": _first(output, "metadata", "meta_path"),
         "manifest": _first(output, "source_manifest", "manifest", "manifest_path"),
+        "sql": _first(output, "sql", "sql_path", "query"),
         "chart_data": _first(output, "chart_data", "chart", "chart_path", "chart_data_path"),
         "row_count": _first(output, "row_count", "rows_count", "rows_generated"),
         "limitations": _list(_first(output, "limitations", "possible_limitations")),

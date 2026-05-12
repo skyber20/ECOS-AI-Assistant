@@ -1,18 +1,17 @@
 import json
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from intent_parser import (
-    IntentParserError,
     IntentType,
     LLMSettings,
     NextAction,
     ResearchIntent,
     _create_json_completion,
-    _load_json_object,
     create_llm_settings,
     none_to_empty_list,
+    parse_llm_json_model,
 )
 
 
@@ -214,7 +213,7 @@ def design_research(
     messages = build_research_design_messages(intent)
 
     content = _create_json_completion(llm_settings, messages)
-    return _parse_design_json(content, intent)
+    return _parse_design_json(content, intent, llm_settings)
 
 
 def build_research_design_messages(intent: ResearchIntent) -> list[dict[str, str]]:
@@ -240,22 +239,22 @@ def build_research_design_messages(intent: ResearchIntent) -> list[dict[str, str
     ]
 
 
-def _parse_design_json(content: str, intent: ResearchIntent) -> ResearchStudyDesign:
-    try:
-        data = _load_json_object(content)
-    except (IntentParserError, json.JSONDecodeError) as exc:
-        raise ResearchDesignerError(f"LLM returned invalid research design JSON: {exc}") from exc
-
-    if not data.get("original_query"):
-        data["original_query"] = intent.original_query
-
-    try:
-        design = ResearchStudyDesign.model_validate(data)
-    except ValidationError as exc:
-        raise ResearchDesignerError(
-            f"LLM JSON does not match ResearchStudyDesign schema: {exc}"
-        ) from exc
-
+def _parse_design_json(
+    content: str,
+    intent: ResearchIntent,
+    settings: LLMSettings,
+) -> ResearchStudyDesign:
+    design = parse_llm_json_model(
+        content,
+        ResearchStudyDesign,
+        settings=settings,
+        error_type=ResearchDesignerError,
+        context={
+            "original_query": intent.original_query,
+            "research_intent": intent.model_dump(mode="json"),
+        },
+        defaults={"original_query": intent.original_query},
+    )
     return _apply_design_corrections(design, intent)
 
 

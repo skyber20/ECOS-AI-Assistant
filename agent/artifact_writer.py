@@ -144,6 +144,9 @@ def _build_output_artifacts(output: dict[str, Any] | None) -> list[WrittenArtifa
         "chart",
         "chart_path",
         "chart_data_path",
+        "sql",
+        "sql_path",
+        "query",
     ]
     artifacts: list[WrittenArtifact] = []
     seen: set[str] = set()

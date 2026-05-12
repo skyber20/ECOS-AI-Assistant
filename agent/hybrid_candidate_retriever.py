@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from functools import lru_cache
 from typing import Any, Iterable
@@ -20,7 +21,10 @@ from intent_parser import ResearchIntent
 VECTOR_TOP_K = 15
 BM25_TOP_K = 15
 CANDIDATE_TOP_K = 30
+RRF_K = 60
 CATALOG_RECORDS_PATH = ROOT / "data" / "catalog_records.jsonl"
+LOGGER = logging.getLogger(__name__)
+_VECTOR_DIAGNOSTIC_LOGGED = False
 CANDIDATE_FIELDS = (
     "record_id",
     "dataset_id",
@@ -50,20 +54,26 @@ def retrieve_candidate_datasets(
     vector_queries, bm25_queries = _retrieval_queries(user_query)
     if not CATALOG_RECORDS_PATH.exists():
         return []
-    vector_results = _search_vector_many(vector_queries, vector_top_k)
-    bm25_results = _search_bm25_many(bm25_queries, bm25_top_k)
-    return _merge_candidates(vector_results, bm25_results)[:candidate_top_k]
+    batches = _search_result_batches(vector_queries, bm25_queries, vector_top_k, bm25_top_k)
+    return _merge_ranked_batches(batches)[:candidate_top_k]
 
 
 def _retrieval_queries(user_query: str | ResearchIntent) -> tuple[list[str], list[str]]:
     if isinstance(user_query, ResearchIntent):
         original_query = _clean_query(user_query.original_query)
-        vector_queries = _dedupe_queries([original_query, user_query.english_query])
-        bm25_queries = _dedupe_queries(
+        focused_queries = _focused_indicator_queries(user_query)
+        vector_queries = _dedupe_queries(
             [
+                *focused_queries,
                 original_query,
                 user_query.english_query,
-                *_keyword_synonym_queries(user_query),
+            ]
+        )
+        bm25_queries = _dedupe_queries(
+            [
+                *focused_queries,
+                original_query,
+                user_query.english_query,
             ]
         )
         return vector_queries, bm25_queries
@@ -72,24 +82,72 @@ def _retrieval_queries(user_query: str | ResearchIntent) -> tuple[list[str], lis
     return [query], [query]
 
 
-def _keyword_synonym_queries(intent: ResearchIntent) -> list[str]:
+def _focused_indicator_queries(intent: ResearchIntent) -> list[str]:
+    focused_queries = _dedupe_queries(
+        [
+            *_keyword_synonym_queries(intent),
+            *_indicator_spec_queries(intent),
+            *_derived_metric_input_queries(intent),
+        ]
+    )
+    return focused_queries or _dedupe_queries(intent.indicators)
+
+
+def _indicator_spec_queries(intent: ResearchIntent) -> list[str]:
     queries: list[str] = []
-    for item in intent.keyword_synonyms:
-        terms = _dedupe_queries([item.english_keyword, *item.synonyms])
-        if terms:
-            queries.append(" ".join(terms))
+    for item in intent.indicator_specs:
+        query = _join_query_terms(
+            [
+                getattr(item, "name", None),
+                getattr(item, "definition", None),
+                getattr(item, "unit", None),
+            ]
+        )
+        if query:
+            queries.append(query)
     return queries
 
 
-def _search_vector_many(queries: list[str], top_k: int) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
+def _keyword_synonym_queries(intent: ResearchIntent) -> list[str]:
+    queries: list[str] = []
+    for item in intent.keyword_synonyms:
+        query = _join_query_terms([item.english_keyword, *item.synonyms])
+        if query:
+            queries.append(query)
+    return queries
+
+
+def _derived_metric_input_queries(intent: ResearchIntent) -> list[str]:
+    queries: list[str] = []
+    for item in intent.derived_metrics:
+        queries.extend(getattr(item, "inputs", []) or [])
+    return queries
+
+
+def _join_query_terms(terms: Iterable[Any]) -> str | None:
+    cleaned_terms = _dedupe_queries(terms)
+    return " ".join(cleaned_terms) if cleaned_terms else None
+
+
+def _search_result_batches(
+    vector_queries: list[str],
+    bm25_queries: list[str],
+    vector_top_k: int,
+    bm25_top_k: int,
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    batches: list[tuple[str, list[dict[str, Any]]]] = []
+    queries = _dedupe_queries([*vector_queries, *bm25_queries])
     for query in queries:
-        results.extend(_search_vector(query, top_k))
-    return results
+        batches.append(("vector", _search_vector(query, vector_top_k)))
+        batches.append(("bm25", _search_bm25(query, bm25_top_k)))
+    return batches
 
 
 def _search_vector(query: str, top_k: int) -> list[dict[str, Any]]:
-    if top_k <= 0 or not CHROMA_DIR.exists():
+    if top_k <= 0:
+        return []
+    if not CHROMA_DIR.exists():
+        _log_vector_diagnostic(f"Chroma directory is missing: {CHROMA_DIR}")
         return []
 
     try:
@@ -107,7 +165,11 @@ def _search_vector(query: str, top_k: int) -> list[dict[str, Any]]:
             n_results=top_k,
             include=["metadatas", "distances"],
         )
-    except Exception:
+    except Exception as error:
+        _log_vector_diagnostic(
+            f"Vector catalog search failed; falling back to BM25. query={query!r}",
+            error,
+        )
         return []
     metadatas = result.get("metadatas", [[]])[0]
     distances = result.get("distances", [[]])[0]
@@ -120,28 +182,31 @@ def _search_vector(query: str, top_k: int) -> list[dict[str, Any]]:
     ]
 
 
-def _search_bm25_many(queries: list[str], top_k: int) -> list[dict[str, Any]]:
+def _search_bm25(query: str, top_k: int) -> list[dict[str, Any]]:
     if top_k <= 0 or not DEFAULT_INDEX_PATH.exists():
         return []
-
-    results: list[dict[str, Any]] = []
-    for query in queries:
-        results.extend(search_bm25(query, top_k=top_k))
-    return results
+    return search_bm25(query, top_k=top_k)
 
 
-def _merge_candidates(
-    vector_results: list[dict[str, Any]],
-    bm25_results: list[dict[str, Any]],
+def _merge_ranked_batches(
+    batches: list[tuple[str, list[dict[str, Any]]]],
 ) -> list[dict[str, Any]]:
     candidates: dict[str, dict[str, Any]] = {}
+    scores: dict[str, float] = {}
 
-    for item in vector_results:
-        _upsert_candidate(candidates, item, "vector")
-    for item in bm25_results:
-        _upsert_candidate(candidates, item, "bm25")
+    for source, results in batches:
+        for rank, item in enumerate(results, start=1):
+            record_id = item.get("record_id")
+            if not record_id:
+                continue
+            _upsert_candidate(candidates, item, source)
+            scores[record_id] = scores.get(record_id, 0.0) + 1.0 / (RRF_K + rank)
 
-    return list(candidates.values())
+    return sorted(
+        candidates.values(),
+        key=lambda candidate: scores.get(candidate["record_id"], 0.0),
+        reverse=True,
+    )
 
 
 def _upsert_candidate(
@@ -199,6 +264,14 @@ def _clean_optional_query(value: Any) -> str | None:
 
 def _empty_to_none(value: Any) -> Any:
     return None if value == "" else value
+
+
+def _log_vector_diagnostic(message: str, error: Exception | None = None) -> None:
+    global _VECTOR_DIAGNOSTIC_LOGGED
+    if _VECTOR_DIAGNOSTIC_LOGGED:
+        return
+    _VECTOR_DIAGNOSTIC_LOGGED = True
+    LOGGER.warning(message, exc_info=error is not None)
 
 
 @lru_cache(maxsize=1)

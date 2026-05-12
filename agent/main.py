@@ -1,5 +1,7 @@
 import shutil
+import sys
 from pathlib import Path
+from typing import TextIO
 
 from openai import OpenAIError
 
@@ -19,7 +21,7 @@ from research_designer import ResearchDesignerError
 from script_generator import ScriptGeneratorError
 
 
-USER_PROMPT = "Статистика по инфляции между Россией и США за 2000-2020"
+USER_PROMPT = "Исследуй ВВП США за 2022 год"
 LLM_PROVIDER: str | None = None
 LLM_MODEL: str | None = None
 USE_DEFAULTS = False
@@ -60,49 +62,79 @@ def main() -> None:
 
 
 def _run_flow_with_clarifications(query: str) -> OrchestrationResult:
-    print("Этап 1: формализация запроса")
+    return run_interactive_research_flow(query)
+
+
+def run_interactive_research_flow(
+    query: str,
+    input_stream: TextIO | None = None,
+    output_stream: TextIO | None = None,
+    error_stream: TextIO | None = None,
+    provider: str | None = LLM_PROVIDER,
+    model: str | None = LLM_MODEL,
+    use_defaults: bool = USE_DEFAULTS,
+    run_build_script: bool = RUN_BUILD_SCRIPT,
+    build_output_dir: str | Path = DATASET_OUTPUT_DIR,
+    max_build_tries: int = MAX_BUILD_TRIES,
+    max_clarification_rounds: int = MAX_CLARIFICATION_ROUNDS,
+) -> OrchestrationResult:
+    prompt = query.strip()
+    if not prompt:
+        raise ValueError("query must not be empty")
+
+    output = output_stream or error_stream or sys.stdout
+    user_input = input_stream or sys.stdin
+
+    print("Этап 1: формализация запроса", file=output)
     intent = parse_research_intent(
-        query,
-        provider=LLM_PROVIDER,
-        model=LLM_MODEL,
+        prompt,
+        provider=provider,
+        model=model,
     )
 
-    for round_number in range(1, MAX_CLARIFICATION_ROUNDS + 1):
-        readiness = prepare_intent_for_design(intent, use_defaults=USE_DEFAULTS)
+    for round_number in range(1, max_clarification_rounds + 1):
+        readiness = prepare_intent_for_design(intent, use_defaults=use_defaults)
         if readiness.status == OrchestrationStatus.READY_FOR_DESIGN:
-            print("Этап 2: RAG, дизайн исследования, генерация и запуск сборки")
+            print("Этап 2: RAG, дизайн исследования, генерация и запуск сборки", file=output)
             return continue_research_flow(
                 intent,
-                provider=LLM_PROVIDER,
-                model=LLM_MODEL,
-                use_defaults=USE_DEFAULTS,
-                run_build_script=RUN_BUILD_SCRIPT,
-                build_output_dir=str(DATASET_OUTPUT_DIR),
-                max_build_tries=MAX_BUILD_TRIES,
+                provider=provider,
+                model=model,
+                use_defaults=use_defaults,
+                run_build_script=run_build_script,
+                build_output_dir=str(build_output_dir),
+                max_build_tries=max_build_tries,
             )
 
         if readiness.status != OrchestrationStatus.NEEDS_CLARIFICATION:
             return readiness
 
-        print(f"Нужно уточнение запроса, раунд {round_number}/{MAX_CLARIFICATION_ROUNDS}")
-        answers = _collect_clarification_answers(readiness.clarification_requests)
+        print(
+            f"Нужно уточнение запроса, раунд {round_number}/{max_clarification_rounds}",
+            file=output,
+        )
+        answers = _collect_clarification_answers(
+            readiness.clarification_requests,
+            input_stream=user_input,
+            output_stream=output,
+        )
         intent = refine_intent_with_clarifications(
             intent,
             answers,
-            provider=LLM_PROVIDER,
-            model=LLM_MODEL,
+            provider=provider,
+            model=model,
         )
 
-    readiness = prepare_intent_for_design(intent, use_defaults=USE_DEFAULTS)
+    readiness = prepare_intent_for_design(intent, use_defaults=use_defaults)
     if readiness.status == OrchestrationStatus.READY_FOR_DESIGN:
         return continue_research_flow(
             intent,
-            provider=LLM_PROVIDER,
-            model=LLM_MODEL,
-            use_defaults=USE_DEFAULTS,
-            run_build_script=RUN_BUILD_SCRIPT,
-            build_output_dir=str(DATASET_OUTPUT_DIR),
-            max_build_tries=MAX_BUILD_TRIES,
+            provider=provider,
+            model=model,
+            use_defaults=use_defaults,
+            run_build_script=run_build_script,
+            build_output_dir=str(build_output_dir),
+            max_build_tries=max_build_tries,
         )
 
     fields = ", ".join(item.field for item in readiness.clarification_requests)
@@ -111,16 +143,22 @@ def _run_flow_with_clarifications(query: str) -> OrchestrationResult:
 
 def _collect_clarification_answers(
     requests: list[ClarificationRequest],
+    input_stream: TextIO | None = None,
+    output_stream: TextIO | None = None,
 ) -> list[ClarificationAnswer]:
+    user_input = input_stream or sys.stdin
+    output = output_stream or sys.stdout
     answers: list[ClarificationAnswer] = []
     for index, request in enumerate(requests, start=1):
-        print("")
-        print(f"Уточнение {index}/{len(requests)}: {request.question}")
-        print(f"Причина: {request.reason}")
+        print("", file=output)
+        print(f"Уточнение {index}/{len(requests)}: {request.question}", file=output)
+        print(f"Причина: {request.reason}", file=output)
         if request.default_assumption:
-            print(f"Можно нажать Enter для default: {request.default_assumption}")
+            print(f"Можно нажать Enter для default: {request.default_assumption}", file=output)
 
-        answer = input("Ответ: ").strip()
+        print("Ответ: ", end="", file=output)
+        output.flush()
+        answer = user_input.readline().strip()
         used_default = False
         if not answer and request.default_assumption:
             answer = request.default_assumption

@@ -22,7 +22,7 @@ from intent_parser import (
     ResearchIntent,
     SYSTEM_PROMPT,
     _create_json_completion,
-    _parse_intent_json,
+    _parse_intent_json_with_repair,
     create_llm_settings,
 )
 from research_designer import ResearchStudyDesign, design_research
@@ -38,6 +38,7 @@ class OrchestrationStatus(str, Enum):
     NEEDS_CLARIFICATION = "needs_clarification"
     READY_FOR_DESIGN = "ready_for_design"
     DESIGN_READY = "design_ready"
+    BUILD_FAILED = "build_failed"
     NO_DATA = "no_data"
     UNSUPPORTED = "unsupported"
 
@@ -274,7 +275,11 @@ class LangGraphResearchAgent:
             ],
         )
         return {
-            "intent": _parse_intent_json(content, original_query=query),
+            "intent": _parse_intent_json_with_repair(
+                content,
+                original_query=query,
+                settings=state["settings"],
+            ),
         }
 
     def _refine_intent_node(self, state: ResearchAgentState) -> ResearchAgentState:
@@ -286,9 +291,10 @@ class LangGraphResearchAgent:
             ),
         )
         return {
-            "intent": _parse_intent_json(
+            "intent": _parse_intent_json_with_repair(
                 content,
                 original_query=state["intent"].original_query,
+                settings=state["settings"],
             ),
         }
 
@@ -345,13 +351,21 @@ class LangGraphResearchAgent:
                 dataset_rerank=state.get("dataset_rerank"),
                 settings=state["settings"],
             )
+        status = OrchestrationStatus.DESIGN_READY
+        message = "Сформированы дизайн исследования, структура датасета и скрипт сборки."
+        if build_run is not None and build_run.status == "failed":
+            status = OrchestrationStatus.BUILD_FAILED
+            message = (
+                f"Скрипт сборки не удалось довести до успешного запуска за {len(build_run.attempts)} "
+                f"попыток. Последняя ошибка: {build_run.final_error}"
+            )
         payload: ResearchAgentState = {
             "research_design": design,
             "dataset_structure": dataset_structure,
             "build_script": build_script,
             "build_run": build_run,
             "result": OrchestrationResult(
-                status=OrchestrationStatus.DESIGN_READY,
+                status=status,
                 intent=state["intent"],
                 clarification_requests=_result_clarifications(state),
                 dataset_rerank=state.get("dataset_rerank"),
@@ -360,7 +374,7 @@ class LangGraphResearchAgent:
                 dataset_structure=dataset_structure,
                 build_script=build_script,
                 build_run=build_run,
-                message="Сформированы дизайн исследования, структура датасета и скрипт сборки.",
+                message=message,
             ),
         }
         return payload

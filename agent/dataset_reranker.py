@@ -3,17 +3,16 @@ from enum import Enum
 from functools import lru_cache
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from catalog_builder import ROOT
 from intent_parser import (
-    IntentParserError,
     LLMSettings,
     ResearchIntent,
     _create_json_completion,
-    _load_json_object,
     create_llm_settings,
     none_to_empty_list,
+    parse_llm_json_model,
 )
 
 
@@ -218,7 +217,7 @@ def rerank_dataset_candidates(
     llm_settings = settings or create_llm_settings(provider=provider, model=model)
     messages = build_dataset_rerank_messages(query, candidate_contexts, top_n=top_n)
     content = _create_json_completion(llm_settings, messages)
-    response = _parse_rerank_json(content)
+    response = _parse_rerank_json(content, llm_settings)
     records_by_id = {candidate["record_id"]: candidate for candidate in candidate_contexts}
     return _hydrate_response(response, records_by_id, top_n=top_n)
 
@@ -299,16 +298,17 @@ def build_dataset_rerank_messages(
     ]
 
 
-def _parse_rerank_json(content: str) -> DatasetRerankResponse:
-    try:
-        data = _load_json_object(content)
-    except (IntentParserError, json.JSONDecodeError) as exc:
-        raise DatasetRerankerError(f"LLM returned invalid rerank JSON: {exc}") from exc
-
-    try:
-        return DatasetRerankResponse.model_validate(data, extra="ignore")
-    except ValidationError as exc:
-        raise DatasetRerankerError(f"LLM JSON does not match DatasetRerankResponse schema: {exc}") from exc
+def _parse_rerank_json(
+    content: str,
+    settings: LLMSettings,
+) -> DatasetRerankResponse:
+    return parse_llm_json_model(
+        content,
+        DatasetRerankResponse,
+        settings=settings,
+        error_type=DatasetRerankerError,
+        extra="ignore",
+    )
 
 
 def _hydrate_response(
