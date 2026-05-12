@@ -24,3 +24,5 @@ COPY . .
 RUN mkdir -p /app/artifacts/runs
 
 EXPOSE 8000 8501
+
+CMD ["sh", "deploy/start_web.sh"]
