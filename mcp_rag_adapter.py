@@ -40,6 +40,45 @@ def retrieve_datasets_via_mcp(intent: ResearchIntent) -> DatasetRerankResponse:
     return search_result_to_rerank(search_result)
 
 
+# Describe-only experiment. Disabled for now because local sample_rows already
+# gives SQL generation the same parquet preview without duplicating LLM context.
+#
+# def describe_datasets_via_mcp(
+#     dataset_rerank: DatasetRerankResponse,
+#     query: str,
+# ) -> list[dict[str, Any]]:
+#     describe_limit = int(os.getenv("MCP_DESCRIBE_LIMIT", "3"))
+#     describes: list[dict[str, Any]] = []
+#
+#     for dataset in dataset_rerank.results[:describe_limit]:
+#         if dataset.source and dataset.dataset_id:
+#             describes.append(
+#                 describe_dataset_via_mcp(
+#                     source=dataset.source,
+#                     indicator_id=dataset.dataset_id,
+#                     query=query,
+#                 )
+#             )
+#
+#     return describes
+#
+#
+# def describe_dataset_via_mcp(
+#     source: str,
+#     indicator_id: str,
+#     query: str,
+# ) -> dict[str, Any]:
+#     return call_mcp_tool(
+#         "extract_data",
+#         {
+#             "source": source,
+#             "indicator_id": indicator_id,
+#             "query": query,
+#             "describe_only": True,
+#         },
+#     )
+
+
 def call_mcp_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     mcp_url = os.getenv("MCP_URL")
     mcp_token = os.getenv("MCP_TOKEN")

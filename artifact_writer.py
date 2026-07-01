@@ -183,4 +183,5 @@ def _build_generation_context_payload(result: OrchestrationResult) -> dict[str, 
         result.research_design,
         result.dataset_structure,
         result.dataset_rerank,
+        # result.dataset_describes,
     )

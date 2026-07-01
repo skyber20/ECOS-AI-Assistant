@@ -24,6 +24,10 @@ from intent_parser import (
     create_llm_settings,
 )
 from mcp_rag_adapter import parse_intent_via_mcp, retrieve_datasets_via_mcp
+
+# Describe-only experiment is disabled for now: local sample_rows already
+# provides parquet previews for SQL generation without duplicating context.
+# from mcp_rag_adapter import describe_datasets_via_mcp
 from research_designer import ResearchStudyDesign, design_research
 from script_generator import (
     BuildScriptRun,
@@ -67,6 +71,7 @@ class OrchestrationResult(BaseModel):
     intent: ResearchIntent
     clarification_requests: list[ClarificationRequest] = Field(default_factory=list)
     dataset_rerank: DatasetRerankResponse | None = None
+    # dataset_describes: list[dict[str, Any]] = Field(default_factory=list)
     explorer_datasets: list[ExplorerDatasetHandoff] = Field(default_factory=list)
     research_design: ResearchStudyDesign | None = None
     dataset_structure: TargetDatasetStructure | None = None
@@ -92,6 +97,7 @@ class ResearchAgentState(TypedDict, total=False):
     use_defaults: bool
     readiness: OrchestrationResult
     dataset_rerank: DatasetRerankResponse
+    # dataset_describes: list[dict[str, Any]]
     explorer_datasets: list[dict[str, str | None]]
     research_design: ResearchStudyDesign
     dataset_structure: TargetDatasetStructure
@@ -297,9 +303,14 @@ class LangGraphResearchAgent:
 
     def _retrieve_datasets_node(self, state: ResearchAgentState) -> ResearchAgentState:
         dataset_rerank = retrieve_datasets_via_mcp(state["intent"])
+        # dataset_describes = describe_datasets_via_mcp(
+        #     dataset_rerank,
+        #     state["intent"].original_query,
+        # )
         explorer_datasets = build_explorer_handoff(dataset_rerank, include_source=True)
         payload: ResearchAgentState = {
             "dataset_rerank": dataset_rerank,
+            # "dataset_describes": dataset_describes,
             "explorer_datasets": explorer_datasets,
         }
         if not explorer_datasets:
@@ -308,6 +319,7 @@ class LangGraphResearchAgent:
                 intent=state["intent"],
                 clarification_requests=_result_clarifications(state),
                 dataset_rerank=dataset_rerank,
+                # dataset_describes=dataset_describes,
                 explorer_datasets=[],
                 message=_rag_no_handoff_message(dataset_rerank),
             )
@@ -323,6 +335,7 @@ class LangGraphResearchAgent:
                 design=design,
                 structure=dataset_structure,
                 dataset_rerank=state.get("dataset_rerank"),
+                # dataset_describes=state.get("dataset_describes", []),
                 settings=state["settings"],
                 output_dir=self.build_output_dir,
                 max_tries=self.max_build_tries,
@@ -333,6 +346,7 @@ class LangGraphResearchAgent:
                 design=design,
                 structure=dataset_structure,
                 dataset_rerank=state.get("dataset_rerank"),
+                # dataset_describes=state.get("dataset_describes", []),
                 settings=state["settings"],
             )
         status = OrchestrationStatus.DESIGN_READY
@@ -353,6 +367,7 @@ class LangGraphResearchAgent:
                 intent=state["intent"],
                 clarification_requests=_result_clarifications(state),
                 dataset_rerank=state.get("dataset_rerank"),
+                # dataset_describes=state.get("dataset_describes", []),
                 explorer_datasets=state.get("explorer_datasets", []),
                 research_design=design,
                 dataset_structure=dataset_structure,

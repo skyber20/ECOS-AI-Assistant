@@ -119,7 +119,7 @@ SQL_GENERATION_PROMPT = """Ты генерируешь DuckDB SQL для сбо�
 - Не добавляй фильтры качества вроде value > 0 или IS NOT NULL для показателей, если это прямо не следует из intent, metadata или schema.
 - Не выдумывай отсутствующие показатели. Если source schema не содержит нужной колонки или источник дает не тот показатель, не синтезируй значения, укажи limitation.
 - Если source_tables недостаточны для сборки целевого датасета без выдумывания данных, верни пустой SELECT по target_structure.columns с WHERE FALSE без FROM source_* и подробно укажи причины в possible_limitations.
-- Если годы или периоды представлены отдельными колонками, приведи их к целевой длинной структуре по фактическим именам колонок.
+- Если годы или периоды представлены отдельными колонками, приведи их к целевой длинной структуре по фактическим именам колонок: год/период должен быть литералом или значением из заголовочной строки, а показатель должен браться из соответствующей колонки данных.
 - Если source_datasets содержит данные только в процентах роста, не называй их уровнем индекса.
 - possible_limitations пиши по-русски, предметно, только из metadata/schema/context.
 """
@@ -141,6 +141,7 @@ SQL_REPAIR_PROMPT = """Ты исправляешь DuckDB SQL для сборк�
 - Не используй Python, CLI, DDL, DML, COPY, CREATE, INSERT, UPDATE, DELETE, DROP, ALTER, INSTALL, LOAD.
 - Не читай файлы в SQL. Используй только source_* таблицы и их колонки.
 - Не выдумывай отсутствующие значения.
+- Если SQL вернул 0 строк, проверь заголовочные строки, wide-формат с годами/периодами в колонках и слишком строгие строковые фильтры.
 - Если ошибку нельзя исправить без выдумывания данных, верни пустой SELECT по target_structure.columns с WHERE FALSE без FROM source_* и укажи ограничения.
 """
 
@@ -158,6 +159,8 @@ def generate_build_script(
     provider: str | None = None,
     model: str | None = None,
 ) -> GeneratedBuildScript:
+    # dataset_describes was tested with MCP describe_only, but is disabled for now:
+    # local sample_rows already provides parquet previews for SQL generation.
     context = build_generation_context(intent, design, structure, dataset_rerank)
     if not context["source_tables"]:
         return _empty_sql_script(context, ["Нет локальных source tables для SQL-сборки."])
@@ -755,6 +758,16 @@ def _source_payloads(dataset_rerank: DatasetRerankResponse | None) -> list[dict[
 
 
 def _source_table_payloads(source_datasets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # MCP describe_only mapping was tested here and disabled: it duplicated
+    # local sample_rows in the LLM context.
+    # describes = {
+    #     (
+    #         str(item.get("source") or "").lower(),
+    #         str(item.get("indicator_id") or ""),
+    #     ): item
+    #     for item in dataset_describes
+    #     if isinstance(item, dict)
+    # }
     tables: list[dict[str, Any]] = []
     for index, source in enumerate(source_datasets, start=1):
         resolved_path = source.get("resolved_data_path")
@@ -762,6 +775,12 @@ def _source_table_payloads(source_datasets: list[dict[str, Any]]) -> list[dict[s
         if not resolved_path or file_format not in SUPPORTED_SOURCE_FORMATS:
             continue
         path = Path(resolved_path)
+        # mcp_describe = describes.get(
+        #     (
+        #         str(source.get("source") or "").lower(),
+        #         str(source.get("dataset_id") or ""),
+        #     )
+        # )
         table = {
             "table_name": f"source_{index}",
             "record_id": source.get("record_id"),
@@ -778,6 +797,7 @@ def _source_table_payloads(source_datasets: list[dict[str, Any]]) -> list[dict[s
             "path_exists": path.exists(),
             "columns": _inspect_schema(path, file_format) if path.exists() else [],
             "sample_rows": _sample_rows(path, file_format) if path.exists() else [],
+            # "mcp_describe": mcp_describe,
             "possible_limitations": source.get("possible_limitations") or [],
         }
         tables.append(table)
