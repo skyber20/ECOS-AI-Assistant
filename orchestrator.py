@@ -12,7 +12,6 @@ from dataset_reranker import (
     DatasetRerankResponse,
     ExplorerDatasetHandoff,
     build_explorer_handoff,
-    retrieve_and_rerank_datasets,
 )
 from dataset_structure import TargetDatasetStructure, build_target_dataset_structure
 from intent_parser import (
@@ -20,11 +19,11 @@ from intent_parser import (
     LLMSettings,
     NextAction,
     ResearchIntent,
-    SYSTEM_PROMPT,
     _create_json_completion,
     _parse_intent_json_with_repair,
     create_llm_settings,
 )
+from mcp_rag_adapter import parse_intent_via_mcp, retrieve_datasets_via_mcp
 from research_designer import ResearchStudyDesign, design_research
 from script_generator import (
     BuildScriptRun,
@@ -266,20 +265,8 @@ class LangGraphResearchAgent:
         return END
 
     def _parse_intent_node(self, state: ResearchAgentState) -> ResearchAgentState:
-        query = state["query"]
-        content = _create_json_completion(
-            state["settings"],
-            [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": query},
-            ],
-        )
         return {
-            "intent": _parse_intent_json_with_repair(
-                content,
-                original_query=query,
-                settings=state["settings"],
-            ),
+            "intent": parse_intent_via_mcp(state["query"]),
         }
 
     def _refine_intent_node(self, state: ResearchAgentState) -> ResearchAgentState:
@@ -309,10 +296,7 @@ class LangGraphResearchAgent:
         return payload
 
     def _retrieve_datasets_node(self, state: ResearchAgentState) -> ResearchAgentState:
-        dataset_rerank = retrieve_and_rerank_datasets(
-            state["intent"],
-            settings=state["settings"],
-        )
+        dataset_rerank = retrieve_datasets_via_mcp(state["intent"])
         explorer_datasets = build_explorer_handoff(dataset_rerank, include_source=True)
         payload: ResearchAgentState = {
             "dataset_rerank": dataset_rerank,

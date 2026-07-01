@@ -22,6 +22,8 @@ services:
 
   ui:
     image: ecos-ai-assistant:local
+    build:
+      context: .
     command: streamlit run app/ui.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true
     environment:
       BACKEND_URL: http://backend:8000
